@@ -8,7 +8,6 @@ import (
 	"html/template"
 	"io"
 	"net/http"
-	"net/smtp"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ type Account struct {
 	Username     string
 	Email        string
 	PasswordHash string
+	PINHash      string
 	Verified     bool
 	AccountNo    string
 	Currency     string
@@ -53,6 +53,7 @@ var (
 	verificationTokens = make(map[string]string) // token -> username
 	resetTokens        = make(map[string]string) // token -> username
 	captchas           = make(map[string]captchaChallenge)
+	loginChallenges    = make(map[string]loginChallenge)
 
 	mu sync.Mutex
 )
@@ -61,6 +62,14 @@ type captchaChallenge struct {
 	Question string
 	Answer   string
 	Expires  time.Time
+	ImageSVG string
+}
+
+type loginChallenge struct {
+	Username string
+	Code     string
+	Expires  time.Time
+	Attempts int
 }
 
 var currencies = []string{
@@ -176,44 +185,38 @@ func loadState() bool {
 }
 
 // ----------------------------------------------------
-// EMAIL + CAPTCHA HELPERS
+// EMAIL + CAPTCHA + 2FA HELPERS
 // ----------------------------------------------------
-
-func smtpConfigured() bool {
-	return os.Getenv("SMTP_HOST") != "" &&
-		os.Getenv("SMTP_PORT") != "" &&
-		os.Getenv("SMTP_USER") != "" &&
-		os.Getenv("SMTP_PASS") != "" &&
-		os.Getenv("SMTP_FROM") != ""
+func emailConfigured() bool {
+	return os.Getenv("RESEND_API_KEY") != "" && os.Getenv("EMAIL_FROM") != ""
 }
 
 func sendEmail(to, subject, body string) error {
-	if !smtpConfigured() {
+	if !emailConfigured() {
 		return fmt.Errorf("email service is not configured")
 	}
-
-	host := os.Getenv("SMTP_HOST")
-	port := os.Getenv("SMTP_PORT")
-	user := os.Getenv("SMTP_USER")
-	pass := os.Getenv("SMTP_PASS")
-	from := os.Getenv("SMTP_FROM")
-
-	message := "From: " + from + "\r\n" +
-		"To: " + to + "\r\n" +
-		"Subject: " + subject + "\r\n" +
-		"MIME-Version: 1.0\r\n" +
-		"Content-Type: text/plain; charset=UTF-8\r\n\r\n" +
-		body
-
-	return smtp.SendMail(
-		host+":"+port,
-		smtp.PlainAuth("", user, pass, host),
-		from,
-		[]string{to},
-		[]byte(message),
-	)
+	payload := map[string]interface{}{"from": os.Getenv("EMAIL_FROM"), "to": []string{to}, "subject": subject, "text": body}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.resend.com/emails", strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("RESEND_API_KEY"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("email provider returned %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
-
 func randomToken() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -221,124 +224,140 @@ func randomToken() string {
 	}
 	return fmt.Sprintf("%x", b)
 }
-
-func newCaptcha() string {
-	b := make([]byte, 2)
+func randomOTP() string {
+	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		return ""
 	}
+	n := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	return fmt.Sprintf("%06d", n%1000000)
+}
 
-	a := int(b[0]%9) + 1
-	c := int(b[1]%9) + 1
+func newCaptcha() string {
 	id := randomToken()
 	if id == "" {
 		return ""
 	}
-
-	mu.Lock()
-	captchas[id] = captchaChallenge{
-		Question: fmt.Sprintf("%d + %d = ?", a, c),
-		Answer:   strconv.Itoa(a + c),
-		Expires:  time.Now().Add(10 * time.Minute),
+	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	raw := make([]byte, 6)
+	r := make([]byte, 6)
+	if _, err := rand.Read(r); err != nil {
+		return ""
 	}
+	for i := range raw {
+		raw[i] = chars[int(r[i])%len(chars)]
+	}
+	answer := string(raw)
+	var svg strings.Builder
+	svg.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" width="260" height="82"><rect width="260" height="82" rx="10" fill="#f1f5f9"/>`)
+	for i := 0; i < 18; i++ {
+		x := int(r[i%6])*4 + i*7
+		y := int(r[(i+2)%6]) % 82
+		x2 := (x + 50 + i*9) % 260
+		y2 := (y + 23 + i*5) % 82
+		svg.WriteString(fmt.Sprintf(`<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#64748b" stroke-width="1" opacity=".35"/>`, x%260, y, x2, y2))
+	}
+	for i, c := range raw {
+		x := 18 + i*39
+		y := 54 + int(r[(i+1)%6])%10
+		rot := -18 + int(r[(i+3)%6])%37
+		svg.WriteString(fmt.Sprintf(`<text x="%d" y="%d" transform="rotate(%d %d %d)" font-family="Arial" font-size="34" font-weight="700" fill="#1e293b">%c</text>`, x, y, rot, x, y, c))
+	}
+	for i := 0; i < 35; i++ {
+		x := int(r[i%6])*5 + i*3
+		y := int(r[(i+1)%6]) % 82
+		svg.WriteString(fmt.Sprintf(`<circle cx="%d" cy="%d" r="1.4" fill="#334155" opacity=".45"/>`, x%260, y))
+	}
+	svg.WriteString(`</svg>`)
+	mu.Lock()
+	captchas[id] = captchaChallenge{Question: "Enter the 6 characters shown in the image.", Answer: answer, Expires: time.Now().Add(5 * time.Minute), ImageSVG: svg.String()}
 	mu.Unlock()
-
 	return id
 }
-
 func captchaHTML(id string) string {
 	mu.Lock()
-	challenge, ok := captchas[id]
+	c, ok := captchas[id]
 	mu.Unlock()
-
 	if !ok {
 		return ""
 	}
-
-	return fmt.Sprintf(`
-<label>Security check: <strong>%s</strong></label>
-<input
-type="text"
-name="captcha"
-inputmode="numeric"
-placeholder="Enter the answer"
-required
->
-<input type="hidden" name="captchaID" value="%s">
-`, template.HTMLEscapeString(challenge.Question), template.HTMLEscapeString(id))
+	return fmt.Sprintf(`<div class="info"><strong>Security check</strong><p>%s</p><img src="/captcha-image?id=%s" alt="CAPTCHA" style="display:block;width:260px;height:82px;border:1px solid #cbd5e1;border-radius:10px;margin:8px 0"><a href="#" onclick="location.reload();return false">Get a new CAPTCHA</a></div><input type="text" name="captcha" maxlength="6" autocomplete="off" placeholder="Enter the characters" required><input type="hidden" name="captchaID" value="%s">`, template.HTMLEscapeString(c.Question), template.HTMLEscapeString(id), template.HTMLEscapeString(id))
 }
-
+func captchaImage(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	mu.Lock()
+	c, ok := captchas[id]
+	mu.Unlock()
+	if !ok || time.Now().After(c.Expires) {
+		http.Error(w, "CAPTCHA expired", http.StatusGone)
+		return
+	}
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprint(w, c.ImageSVG)
+}
 func verifyCaptcha(id, answer string) bool {
 	mu.Lock()
 	defer mu.Unlock()
-
-	challenge, ok := captchas[id]
-	if !ok || time.Now().After(challenge.Expires) {
+	c, ok := captchas[id]
+	if !ok || time.Now().After(c.Expires) {
 		delete(captchas, id)
 		return false
 	}
-
 	delete(captchas, id)
-	return strings.TrimSpace(answer) == challenge.Answer
+	return strings.EqualFold(strings.TrimSpace(answer), c.Answer)
 }
-
 func baseURL() string {
-	value := strings.TrimRight(strings.TrimSpace(os.Getenv("APP_BASE_URL")), "/")
-	if value != "" {
-		return value
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("APP_BASE_URL")), "/"); v != "" {
+		return v
+	}
+	if v := strings.TrimRight(os.Getenv("RENDER_EXTERNAL_URL"), "/"); v != "" {
+		return v
 	}
 	return "http://localhost:8080"
 }
-
 func renderError(w http.ResponseWriter, title, message, backURL string) {
 	fmt.Fprintln(w, pageStart(title))
-	fmt.Fprintf(w, `
-<div class="container">
-<div class="card">
-<div class="error">%s</div>
-<a href="%s"><button>Try Again</button></a>
-</div>
-</div>
-</body>
-</html>
-`, template.HTMLEscapeString(message), backURL)
+	fmt.Fprintf(w, `<div class="container"><div class="card"><div class="error">%s</div><a href="%s"><button>Try Again</button></a></div></div></body></html>`, template.HTMLEscapeString(message), backURL)
 }
 
 // ----------------------------------------------------
 // PASSWORD
 // ----------------------------------------------------
-
 func hashPassword(password string) string {
-	hash := sha256.Sum256([]byte(password))
-	return fmt.Sprintf("%x", hash)
+	h := sha256.Sum256([]byte(password))
+	return fmt.Sprintf("%x", h)
 }
-
 func validPassword(password string) bool {
-	if len(password) < 8 {
+	if len(password) < 10 {
 		return false
 	}
-
-	var upper, lower, number, symbol bool
-
+	var u, l, n, s bool
 	for _, c := range password {
 		switch {
 		case c >= 'A' && c <= 'Z':
-			upper = true
+			u = true
 		case c >= 'a' && c <= 'z':
-			lower = true
+			l = true
 		case c >= '0' && c <= '9':
-			number = true
+			n = true
 		default:
-			symbol = true
+			s = true
 		}
 	}
-
-	return upper && lower && number && symbol
+	return u && l && n && s
 }
-
-// ----------------------------------------------------
-// ACCOUNT NUMBERS
-// ----------------------------------------------------
+func validPIN(pin string) bool {
+	if len(pin) != 4 {
+		return false
+	}
+	for _, c := range pin {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 func generateAccountNumber() string {
 	for {
@@ -831,6 +850,10 @@ required
 autocomplete="email"
 >
 
+<label>Transaction PIN</label>
+<input type="password" name="pin" inputmode="numeric" maxlength="4" minlength="4" pattern="[0-9]{4}" required autocomplete="off">
+<p><small>Your 4-digit transaction PIN is required before sending money.</small></p>
+
 <label>Password</label>
 <div style="display:flex; gap:8px;">
 <input
@@ -960,9 +983,10 @@ function toggleField(id, button) {
 	username := strings.TrimSpace(r.FormValue("username"))
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	password := r.FormValue("password")
+	pin := strings.TrimSpace(r.FormValue("pin"))
 	currency := strings.ToUpper(r.FormValue("currency"))
 
-	if name == "" || username == "" || email == "" || password == "" {
+	if name == "" || username == "" || email == "" || password == "" || pin == "" {
 		renderError(w, "Error", "Please complete all fields.", "/register")
 		return
 	}
@@ -990,7 +1014,11 @@ function toggleField(id, button) {
 	}
 
 	if !validPassword(password) {
-		renderError(w, "Password Error", "Password must have at least 8 characters, one uppercase letter, one lowercase letter, one number, and one symbol.", "/register")
+		renderError(w, "Password Error", "Password must have at least 10 characters, one uppercase letter, one lowercase letter, one number, and one symbol.", "/register")
+		return
+	}
+	if !validPIN(pin) {
+		renderError(w, "PIN Error", "Your transaction PIN must be exactly 4 digits.", "/register")
 		return
 	}
 
@@ -1030,6 +1058,7 @@ function toggleField(id, button) {
 		Username:     username,
 		Email:        email,
 		PasswordHash: hashPassword(password),
+		PINHash:      hashPassword(pin),
 		Verified:     false,
 		AccountNo:    accountNumber,
 		Currency:     currency,
@@ -1058,7 +1087,7 @@ function toggleField(id, button) {
 		persistLocked()
 		mu.Unlock()
 
-		renderError(w, "Email Setup Required", "Your account could not be created because the email service is not configured. Add the SMTP environment variables in Render and try again.", "/register")
+		renderError(w, "Email Setup Required", "Your account could not be created because the email service is not configured. Add RESEND_API_KEY and EMAIL_FROM in Render and try again.", "/register")
 		return
 	}
 
@@ -1374,48 +1403,86 @@ func login(w http.ResponseWriter, r *http.Request) {
 		loginPage(w, "")
 		return
 	}
-
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	password := r.FormValue("password")
-
 	if !verifyCaptcha(r.FormValue("captchaID"), r.FormValue("captcha")) {
 		loginPage(w, `<div class="error">Incorrect or expired CAPTCHA. Please try again.</div>`)
 		return
 	}
-
 	mu.Lock()
-	account := (*Account)(nil)
+	var account *Account
 	for i := range accounts {
 		if strings.EqualFold(accounts[i].Email, email) {
 			account = &accounts[i]
 			break
 		}
 	}
-
 	if account == nil || account.PasswordHash != hashPassword(password) {
 		mu.Unlock()
 		loginPage(w, `<div class="error">Invalid email or password.</div>`)
 		return
 	}
-
 	if !account.Verified {
 		mu.Unlock()
 		loginPage(w, `<div class="error">Please verify your email before signing in.</div>`)
 		return
 	}
-
-	sessionID := createSession(account.Username)
+	challengeID := randomToken()
+	code := randomOTP()
+	if challengeID == "" || code == "" {
+		mu.Unlock()
+		loginPage(w, `<div class="error">Unable to start two-step verification.</div>`)
+		return
+	}
+	loginChallenges[challengeID] = loginChallenge{Username: account.Username, Code: code, Expires: time.Now().Add(10 * time.Minute)}
+	name := account.Name
 	mu.Unlock()
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
-		Value:    sessionID,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		Path:     "/",
-	})
-
+	if err := sendEmail(email, "Your sign-in verification code", fmt.Sprintf("Hello %s,\n\nYour sign-in verification code is: %s\n\nIt expires in 10 minutes.", name, code)); err != nil {
+		mu.Lock()
+		delete(loginChallenges, challengeID)
+		mu.Unlock()
+		loginPage(w, `<div class="error">We could not send your verification code. Email delivery is not configured correctly.</div>`)
+		return
+	}
+	fmt.Fprintln(w, pageStart("Two-Step Verification"))
+	fmt.Fprintf(w, `<div class="container"><div class="card"><h1>🔐 Two-Step Verification</h1><div class="success">A 6-digit code was sent to <strong>%s</strong>.</div><form action="/verify-login" method="POST"><input type="hidden" name="challenge" value="%s"><label>Verification Code</label><input type="text" name="code" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" autocomplete="one-time-code" required><button type="submit">Verify & Sign In</button></form><p><small>The code expires in 10 minutes.</small></p></div></div></body></html>`, template.HTMLEscapeString(email), template.HTMLEscapeString(challengeID))
+}
+func verifyLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("challenge"))
+	code := strings.TrimSpace(r.FormValue("code"))
+	mu.Lock()
+	c, ok := loginChallenges[id]
+	if !ok || time.Now().After(c.Expires) {
+		delete(loginChallenges, id)
+		mu.Unlock()
+		loginPage(w, `<div class="error">That verification code has expired. Please sign in again.</div>`)
+		return
+	}
+	if c.Attempts >= 5 {
+		delete(loginChallenges, id)
+		mu.Unlock()
+		loginPage(w, `<div class="error">Too many incorrect attempts. Please sign in again.</div>`)
+		return
+	}
+	if code != c.Code {
+		c.Attempts++
+		loginChallenges[id] = c
+		mu.Unlock()
+		renderError(w, "Verification Failed", "Incorrect verification code.", "/")
+		return
+	}
+	sessionID := createSession(c.Username)
+	delete(loginChallenges, id)
+	mu.Unlock()
+	if sessionID == "" {
+		loginPage(w, `<div class="error">Unable to create your session.</div>`)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionID, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, Path: "/", MaxAge: 14400})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -1494,6 +1561,9 @@ step="0.01"
 min="0.01"
 required
 >
+
+<label>Transaction PIN</label>
+<input type="password" name="pin" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" required autocomplete="off">
 
 <button type="submit">
 Send Money
@@ -1697,6 +1767,8 @@ Please sign in first.
 		64,
 	)
 
+	pin := strings.TrimSpace(r.FormValue("pin"))
+
 	if err != nil || amount <= 0 {
 		fmt.Fprintln(w, "Invalid amount.")
 		return
@@ -1722,6 +1794,13 @@ Please sign in first.
 			"You cannot send money to yourself.",
 		)
 
+		return
+	}
+
+	if !validPIN(pin) || sender.PINHash != hashPassword(pin) {
+		mu.Unlock()
+		fmt.Fprintln(w, pageStart("Transfer Failed"))
+		fmt.Fprintln(w, `<div class="container"><div class="card"><div class="error"><h2>Transfer Failed ❌</h2><p>Incorrect transaction PIN.</p></div><a href="/send"><button>Try Again</button></a></div></div></body></html>`)
 		return
 	}
 
@@ -2774,6 +2853,8 @@ func main() {
 
 	http.HandleFunc("/register", registerPage)
 	http.HandleFunc("/login", login)
+	http.HandleFunc("/verify-login", verifyLogin)
+	http.HandleFunc("/captcha-image", captchaImage)
 	http.HandleFunc("/verify-email", verifyEmail)
 	http.HandleFunc("/forgot-password", forgotPasswordPage)
 	http.HandleFunc("/reset-password", func(w http.ResponseWriter, r *http.Request) {
