@@ -938,6 +938,10 @@ func registerPage(w http.ResponseWriter, r *http.Request) {
 </ul>
 </div>
 
+<label>Transaction PIN</label>
+<input type="password" name="pin" inputmode="numeric" maxlength="4" minlength="4" pattern="[0-9]{4}" required autocomplete="off">
+<p><small>Choose a 4-digit PIN. You'll need this to send money and to sign in.</small></p>
+
 <label>Currency</label>
 <select name="currency">
 <option value="USD">USD - US Dollar</option>
