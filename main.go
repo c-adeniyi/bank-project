@@ -2815,6 +2815,23 @@ func main() {
 	fmt.Println("       CALEB'S CITY MALL BANK")
 	fmt.Println("==============================================")
 
+	// Diagnostic: confirms whether the running process can actually
+	// see RESEND_API_KEY and EMAIL_FROM. Check your Render logs after
+	// deploying — if either says "NOT SET", the env vars aren't reaching
+	// this process (wrong service, needs redeploy, name typo, etc.),
+	// even if they look correct in the Render dashboard.
+	if os.Getenv("RESEND_API_KEY") != "" {
+		fmt.Println("RESEND_API_KEY: set (", len(os.Getenv("RESEND_API_KEY")), "chars )")
+	} else {
+		fmt.Println("RESEND_API_KEY: NOT SET")
+	}
+	if os.Getenv("EMAIL_FROM") != "" {
+		fmt.Println("EMAIL_FROM:", os.Getenv("EMAIL_FROM"))
+	} else {
+		fmt.Println("EMAIL_FROM: NOT SET")
+	}
+	fmt.Println("==============================================")
+
 	// Try to load existing accounts/transactions from disk
 	// first (data.json). This is what makes the app survive
 	// restarts instead of wiping every account and generating
