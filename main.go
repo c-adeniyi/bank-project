@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"net/smtp"
 	"os"
 	"strconv"
 	"strings"
@@ -18,7 +19,9 @@ import (
 type Account struct {
 	Name         string
 	Username     string
+	Email        string
 	PasswordHash string
+	Verified     bool
 	AccountNo    string
 	Currency     string
 	Balance      float64
@@ -46,8 +49,19 @@ var (
 	accounts     []Account
 	transactions = make(map[string][]Transaction)
 	sessions     = make(map[string]string)
-	mu           sync.Mutex
+
+	verificationTokens = make(map[string]string) // token -> username
+	resetTokens        = make(map[string]string) // token -> username
+	captchas           = make(map[string]captchaChallenge)
+
+	mu sync.Mutex
 )
+
+type captchaChallenge struct {
+	Question string
+	Answer   string
+	Expires  time.Time
+}
 
 var currencies = []string{
 	"USD",
@@ -142,6 +156,14 @@ func loadState() bool {
 		return false
 	}
 
+	// Migrate accounts created by older versions of the demo.
+	for i := range state.Accounts {
+		if state.Accounts[i].Email == "" {
+			state.Accounts[i].Email = state.Accounts[i].Username + "@example.com"
+			state.Accounts[i].Verified = true
+		}
+	}
+
 	accounts = state.Accounts
 
 	if state.Transactions != nil {
@@ -151,6 +173,135 @@ func loadState() bool {
 	}
 
 	return true
+}
+
+// ----------------------------------------------------
+// EMAIL + CAPTCHA HELPERS
+// ----------------------------------------------------
+
+func smtpConfigured() bool {
+	return os.Getenv("SMTP_HOST") != "" &&
+		os.Getenv("SMTP_PORT") != "" &&
+		os.Getenv("SMTP_USER") != "" &&
+		os.Getenv("SMTP_PASS") != "" &&
+		os.Getenv("SMTP_FROM") != ""
+}
+
+func sendEmail(to, subject, body string) error {
+	if !smtpConfigured() {
+		return fmt.Errorf("email service is not configured")
+	}
+
+	host := os.Getenv("SMTP_HOST")
+	port := os.Getenv("SMTP_PORT")
+	user := os.Getenv("SMTP_USER")
+	pass := os.Getenv("SMTP_PASS")
+	from := os.Getenv("SMTP_FROM")
+
+	message := "From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n\r\n" +
+		body
+
+	return smtp.SendMail(
+		host+":"+port,
+		smtp.PlainAuth("", user, pass, host),
+		from,
+		[]string{to},
+		[]byte(message),
+	)
+}
+
+func randomToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", b)
+}
+
+func newCaptcha() string {
+	b := make([]byte, 2)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+
+	a := int(b[0]%9) + 1
+	c := int(b[1]%9) + 1
+	id := randomToken()
+	if id == "" {
+		return ""
+	}
+
+	mu.Lock()
+	captchas[id] = captchaChallenge{
+		Question: fmt.Sprintf("%d + %d = ?", a, c),
+		Answer:   strconv.Itoa(a + c),
+		Expires:  time.Now().Add(10 * time.Minute),
+	}
+	mu.Unlock()
+
+	return id
+}
+
+func captchaHTML(id string) string {
+	mu.Lock()
+	challenge, ok := captchas[id]
+	mu.Unlock()
+
+	if !ok {
+		return ""
+	}
+
+	return fmt.Sprintf(`
+<label>Security check: <strong>%s</strong></label>
+<input
+type="text"
+name="captcha"
+inputmode="numeric"
+placeholder="Enter the answer"
+required
+>
+<input type="hidden" name="captchaID" value="%s">
+`, template.HTMLEscapeString(challenge.Question), template.HTMLEscapeString(id))
+}
+
+func verifyCaptcha(id, answer string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+
+	challenge, ok := captchas[id]
+	if !ok || time.Now().After(challenge.Expires) {
+		delete(captchas, id)
+		return false
+	}
+
+	delete(captchas, id)
+	return strings.TrimSpace(answer) == challenge.Answer
+}
+
+func baseURL() string {
+	value := strings.TrimRight(strings.TrimSpace(os.Getenv("APP_BASE_URL")), "/")
+	if value != "" {
+		return value
+	}
+	return "http://localhost:8080"
+}
+
+func renderError(w http.ResponseWriter, title, message, backURL string) {
+	fmt.Fprintln(w, pageStart(title))
+	fmt.Fprintf(w, `
+<div class="container">
+<div class="card">
+<div class="error">%s</div>
+<a href="%s"><button>Try Again</button></a>
+</div>
+</div>
+</body>
+</html>
+`, template.HTMLEscapeString(message), backURL)
 }
 
 // ----------------------------------------------------
@@ -527,6 +678,8 @@ button:hover {
 <a href="/withdraw">Withdraw</a>
 <a href="/transactions">Transactions</a>
 <a href="/profile">Profile</a>
+<a href="/change-password">Password</a>
+<a href="/change-currency">Currency</a>
 <a href="/logout">Logout</a>
 </div>
 
@@ -655,62 +808,68 @@ func home(w http.ResponseWriter, r *http.Request) {
 // ----------------------------------------------------
 
 func loginPage(w http.ResponseWriter, message string) {
+	captchaID := newCaptcha()
 
 	fmt.Fprintln(w, pageStart("Login"))
 
 	fmt.Fprintf(w, `
-
 <div class="container">
-
 <div class="card">
 
 <h1>Welcome Back 👋</h1>
-
 <p>Sign in to Caleb's City Mall Bank.</p>
 
 %s
 
 <form action="/login" method="POST">
 
-<label>Username</label>
-
+<label>Email</label>
 <input
-type="text"
-name="username"
+type="email"
+name="email"
 required
+autocomplete="email"
 >
 
 <label>Password</label>
-
+<div style="display:flex; gap:8px;">
 <input
+id="loginPassword"
 type="password"
 name="password"
 required
+autocomplete="current-password"
 >
+<button type="button" class="show-password" onclick="toggleField('loginPassword', this)">Show</button>
+</div>
 
-<button type="submit">
-Sign In
-</button>
+%s
 
+<button type="submit">Sign In</button>
 </form>
 
-<p>
-<a href="/forgot-password">Forgot your password?</a>
-</p>
-
-<p>
-Don't have an account?
-<a href="/register">Create an account</a>
-</p>
+<p><a href="/forgot-password">Forgot your password?</a></p>
+<p>Don't have an account? <a href="/register">Create an account</a></p>
 
 </div>
-
 </div>
+
+<script>
+function toggleField(id, button) {
+	const field = document.getElementById(id);
+	if (field.type === "password") {
+		field.type = "text";
+		button.textContent = "Hide";
+	} else {
+		field.type = "password";
+		button.textContent = "Show";
+	}
+}
+</script>
 
 </body>
 </html>
-
-`, message)
+`, message, captchaHTML(captchaID))
 }
 
 // ----------------------------------------------------
@@ -718,15 +877,12 @@ Don't have an account?
 // ----------------------------------------------------
 
 func registerPage(w http.ResponseWriter, r *http.Request) {
-
 	if r.Method == "GET" {
+		captchaID := newCaptcha()
 
 		fmt.Fprintln(w, pageStart("Register"))
-
-		fmt.Fprintln(w, `
-
+		fmt.Fprintf(w, `
 <div class="container">
-
 <div class="card">
 
 <h1>🏦 Create Account</h1>
@@ -734,33 +890,22 @@ func registerPage(w http.ResponseWriter, r *http.Request) {
 <form action="/register" method="POST">
 
 <label>Full Name</label>
-
-<input
-type="text"
-name="name"
-required
->
+<input type="text" name="name" required>
 
 <label>Username</label>
+<input type="text" name="username" required>
 
-<input
-type="text"
-name="username"
-required
->
+<label>Email</label>
+<input type="email" name="email" required autocomplete="email">
 
 <label>Password</label>
-
-<input
-type="password"
-name="password"
-required
->
+<div style="display:flex; gap:8px;">
+<input id="registerPassword" type="password" name="password" required autocomplete="new-password">
+<button type="button" class="show-password" onclick="toggleField('registerPassword', this)">Show</button>
+</div>
 
 <div class="info">
-
 <strong>Password requirements:</strong>
-
 <ul>
 <li>At least 8 characters</li>
 <li>1 uppercase letter</li>
@@ -768,13 +913,10 @@ required
 <li>1 number</li>
 <li>1 symbol</li>
 </ul>
-
 </div>
 
 <label>Currency</label>
-
 <select name="currency">
-
 <option value="USD">USD - US Dollar</option>
 <option value="EUR">EUR - Euro</option>
 <option value="GBP">GBP - British Pound</option>
@@ -783,512 +925,348 @@ required
 <option value="CAD">CAD - Canadian Dollar</option>
 <option value="AUD">AUD - Australian Dollar</option>
 <option value="CHF">CHF - Swiss Franc</option>
-
 </select>
 
-<button type="submit">
-Create Account
-</button>
+%s
 
+<button type="submit">Create Account</button>
 </form>
 
-<p>
-Already have an account?
-<a href="/">Sign in</a>
-</p>
+<p>Already have an account? <a href="/">Sign in</a></p>
 
 </div>
-
 </div>
+
+<script>
+function toggleField(id, button) {
+	const field = document.getElementById(id);
+	if (field.type === "password") {
+		field.type = "text";
+		button.textContent = "Hide";
+	} else {
+		field.type = "password";
+		button.textContent = "Show";
+	}
+}
+</script>
 
 </body>
 </html>
-
-`)
-
+`, captchaHTML(captchaID))
 		return
 	}
 
 	name := strings.TrimSpace(r.FormValue("name"))
 	username := strings.TrimSpace(r.FormValue("username"))
+	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	password := r.FormValue("password")
 	currency := strings.ToUpper(r.FormValue("currency"))
 
-	if name == "" || username == "" || password == "" {
-		fmt.Fprintln(w, "Please complete all fields.")
+	if name == "" || username == "" || email == "" || password == "" {
+		renderError(w, "Error", "Please complete all fields.", "/register")
+		return
+	}
+
+	if !strings.Contains(email, "@") {
+		renderError(w, "Error", "Please enter a valid email address.", "/register")
+		return
+	}
+
+	if !verifyCaptcha(r.FormValue("captchaID"), r.FormValue("captcha")) {
+		renderError(w, "Security Check Failed", "Incorrect or expired CAPTCHA. Please try again.", "/register")
 		return
 	}
 
 	validCurrency := false
-
 	for _, c := range currencies {
 		if currency == c {
 			validCurrency = true
 			break
 		}
 	}
-
 	if !validCurrency {
-		fmt.Fprintln(w, "Invalid currency.")
+		renderError(w, "Error", "Invalid currency.", "/register")
 		return
 	}
 
 	if !validPassword(password) {
-
-		fmt.Fprintln(w, pageStart("Password Error"))
-
-		fmt.Fprintln(w, `
-
-<div class="container">
-
-<div class="card">
-
-<div class="error">
-
-<strong>Password does not meet the requirements.</strong>
-
-<ul>
-<li>At least 8 characters</li>
-<li>1 uppercase letter</li>
-<li>1 lowercase letter</li>
-<li>1 number</li>
-<li>1 symbol</li>
-</ul>
-
-</div>
-
-<a href="/register">
-<button>Try Again</button>
-</a>
-
-</div>
-
-</div>
-
-</body>
-</html>
-
-`)
-
+		renderError(w, "Password Error", "Password must have at least 8 characters, one uppercase letter, one lowercase letter, one number, and one symbol.", "/register")
 		return
 	}
 
 	mu.Lock()
-
 	if findAccount(username) != nil {
 		mu.Unlock()
-
-		fmt.Fprintln(w, pageStart("Error"))
-
-		fmt.Fprintln(w, `
-
-<div class="container">
-
-<div class="card">
-
-<div class="error">
-That username already exists.
-</div>
-
-<a href="/register">
-<button>Try Again</button>
-</a>
-
-</div>
-
-</div>
-
-</body>
-</html>
-
-`)
-
+		renderError(w, "Error", "That username already exists.", "/register")
 		return
 	}
-
+	for _, a := range accounts {
+		if strings.EqualFold(a.Email, email) {
+			mu.Unlock()
+			renderError(w, "Error", "That email address is already registered.", "/register")
+			return
+		}
+	}
 	accountNumber := generateAccountNumber()
-
 	mu.Unlock()
 
 	rate, err := getExchangeRate("USD", currency)
-
 	if err != nil {
+		renderError(w, "Error", "Unable to get the exchange rate. Please try again later.", "/register")
+		return
+	}
 
-		fmt.Fprintln(w, pageStart("Error"))
-
-		fmt.Fprintln(w, `
-
-<div class="container">
-
-<div class="card">
-
-<div class="error">
-Unable to get the exchange rate.
-Please try again later.
-</div>
-
-<a href="/register">
-<button>Try Again</button>
-</a>
-
-</div>
-
-</div>
-
-</body>
-</html>
-
-`)
-
+	token := randomToken()
+	if token == "" {
+		renderError(w, "Error", "Unable to create verification link. Please try again.", "/register")
 		return
 	}
 
 	startingBalance := 1000 * rate
 
 	mu.Lock()
-
 	accounts = append(accounts, Account{
 		Name:         name,
 		Username:     username,
+		Email:        email,
 		PasswordHash: hashPassword(password),
+		Verified:     false,
 		AccountNo:    accountNumber,
 		Currency:     currency,
 		Balance:      startingBalance,
 	})
-
+	verificationTokens[token] = username
 	persistLocked()
-
 	mu.Unlock()
 
-	fmt.Fprintln(w, pageStart("Account Created"))
+	verifyURL := baseURL() + "/verify-email?token=" + token
+	emailBody := fmt.Sprintf(
+		"Hello %s,\n\nWelcome to Caleb's City Mall Bank.\n\nVerify your email by opening this link:\n%s\n\nIf you did not create this account, ignore this email.",
+		name, verifyURL,
+	)
 
+	if err := sendEmail(email, "Verify your Caleb's City Mall Bank account", emailBody); err != nil {
+		// Remove the just-created account if email delivery is not configured.
+		mu.Lock()
+		for i := range accounts {
+			if accounts[i].Username == username {
+				accounts = append(accounts[:i], accounts[i+1:]...)
+				break
+			}
+		}
+		delete(verificationTokens, token)
+		persistLocked()
+		mu.Unlock()
+
+		renderError(w, "Email Setup Required", "Your account could not be created because the email service is not configured. Add the SMTP environment variables in Render and try again.", "/register")
+		return
+	}
+
+	fmt.Fprintln(w, pageStart("Verify Email"))
 	fmt.Fprintf(w, `
-
 <div class="container">
-
 <div class="card">
-
 <div class="success">
-
 <h1>Account Created! 🎉</h1>
-
+<p>We sent a verification email to <strong>%s</strong>.</p>
+<p>Open the email and click the verification link before signing in.</p>
 </div>
-
-<h2>Welcome, %s!</h2>
-
 <p>Your account number:</p>
-
-<div class="account-number">
-%s
+<div class="account-number">%s</div>
+<p>Starting balance: <strong>%.2f %s</strong></p>
+<a href="/"><button>Go to Login</button></a>
 </div>
-
-<p>
-Starting balance:
-<strong>%.2f %s</strong>
-</p>
-
-<p>
-This is approximately equal to $1,000 USD.
-</p>
-
-<a href="/">
-<button>Go to Login</button>
-</a>
-
 </div>
-
-</div>
-
 </body>
 </html>
-
 `,
-		template.HTMLEscapeString(name),
-		accountNumber,
+		template.HTMLEscapeString(email),
+		template.HTMLEscapeString(accountNumber),
 		startingBalance,
-		currency,
+		template.HTMLEscapeString(currency),
 	)
 }
 
 // ----------------------------------------------------
-// FORGOT PASSWORD / PASSWORD RESET
-// ----------------------------------------------------
-//
-// Demo recovery flow:
-// 1. User enters username + account number.
-// 2. If both match, the user can choose a new password.
-// 3. All existing sessions for that username are invalidated.
-//
-// For a real banking system, recovery should use a verified
-// email/phone plus a one-time, expiring reset token.
+// EMAIL VERIFICATION / FORGOT PASSWORD / RESET
 // ----------------------------------------------------
 
-func forgotPasswordPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		fmt.Fprintln(w, pageStart("Forgot Password"))
-
-		fmt.Fprintln(w, `
-<div class="container">
-
-<div class="card">
-
-<h1>🔐 Forgot Password</h1>
-
-<p>Enter your username and account number to verify your account.</p>
-
-<form action="/forgot-password" method="POST">
-
-<label>Username</label>
-
-<input
-type="text"
-name="username"
-required
-autocomplete="username"
->
-
-<label>Account Number</label>
-
-<input
-type="text"
-name="account"
-required
-maxlength="10"
-inputmode="numeric"
->
-
-<button type="submit">
-Continue
-</button>
-
-</form>
-
-<p>
-<a href="/">Back to login</a>
-</p>
-
-</div>
-
-</div>
-
-</body>
-</html>
-`)
-
-		return
-	}
-
-	username := strings.TrimSpace(r.FormValue("username"))
-	accountNumber := strings.TrimSpace(r.FormValue("account"))
-
-	if username == "" || accountNumber == "" {
-		fmt.Fprintln(w, pageStart("Forgot Password"))
-
-		fmt.Fprintln(w, `
-<div class="container">
-<div class="card">
-
-<div class="error">
-Please enter both your username and account number.
-</div>
-
-<a href="/forgot-password">
-<button>Try Again</button>
-</a>
-
-</div>
-</div>
-
-</body>
-</html>
-`)
-
-		return
-	}
+func verifyEmail(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.URL.Query().Get("token"))
 
 	mu.Lock()
+	username := verificationTokens[token]
 	account := findAccount(username)
 
-	matches := account != nil && account.AccountNo == accountNumber
-
-	mu.Unlock()
-
-	if !matches {
-		fmt.Fprintln(w, pageStart("Forgot Password"))
-
-		fmt.Fprintln(w, `
-<div class="container">
-<div class="card">
-
-<div class="error">
-The username and account number could not be verified.
-</div>
-
-<a href="/forgot-password">
-<button>Try Again</button>
-</a>
-
-</div>
-</div>
-
-</body>
-</html>
-`)
-
+	if token == "" || username == "" || account == nil {
+		mu.Unlock()
+		renderError(w, "Verification Failed", "This verification link is invalid or has already been used.", "/")
 		return
 	}
 
-	// The account was verified. Show the password-reset form.
-	fmt.Fprintln(w, pageStart("Reset Password"))
+	account.Verified = true
+	delete(verificationTokens, token)
+	persistLocked()
+	mu.Unlock()
 
+	fmt.Fprintln(w, pageStart("Email Verified"))
 	fmt.Fprintln(w, `
 <div class="container">
-
 <div class="card">
-
-<h1>🔑 Reset Password</h1>
-
 <div class="success">
-Account verified. Choose a new password.
+<h1>Email Verified! ✅</h1>
+<p>Your email has been verified successfully. You can now log in.</p>
 </div>
-
-<form action="/reset-password" method="POST">
-
-<input
-type="hidden"
-name="username"
-value="` + template.HTMLEscapeString(username) + `"
->
-
-<input
-type="hidden"
-name="account"
-value="` + template.HTMLEscapeString(accountNumber) + `"
->
-
-<label>New Password</label>
-
-<input
-type="password"
-name="password"
-required
-autocomplete="new-password"
->
-
-<label>Confirm New Password</label>
-
-<input
-type="password"
-name="confirmPassword"
-required
-autocomplete="new-password"
->
-
-<div class="info">
-
-<strong>Password requirements:</strong>
-
-<ul>
-<li>At least 8 characters</li>
-<li>1 uppercase letter</li>
-<li>1 lowercase letter</li>
-<li>1 number</li>
-<li>1 symbol</li>
-</ul>
-
+<a href="/"><button>Go to Login</button></a>
 </div>
-
-<button type="submit">
-Reset Password
-</button>
-
-</form>
-
 </div>
-
-</div>
-
 </body>
 </html>
 `)
 }
 
-func resetPassword(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(
-			w,
-			"Method not allowed",
-			http.StatusMethodNotAllowed,
-		)
-		return
-	}
+func forgotPasswordPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		captchaID := newCaptcha()
 
-	username := strings.TrimSpace(r.FormValue("username"))
-	accountNumber := strings.TrimSpace(r.FormValue("account"))
-	password := r.FormValue("password")
-	confirmPassword := r.FormValue("confirmPassword")
-
-	if username == "" || accountNumber == "" {
-		fmt.Fprintln(w, pageStart("Reset Password"))
-
-		fmt.Fprintln(w, `
+		fmt.Fprintln(w, pageStart("Forgot Password"))
+		fmt.Fprintf(w, `
 <div class="container">
 <div class="card">
 
-<div class="error">
-Invalid password reset request.
-</div>
+<h1>🔐 Forgot Password</h1>
+<p>Enter the email address connected to your account.</p>
 
-<a href="/forgot-password">
-<button>Start Again</button>
-</a>
+<form action="/forgot-password" method="POST">
+
+<label>Email</label>
+<input type="email" name="email" required autocomplete="email">
+
+%s
+
+<button type="submit">Send Reset Email</button>
+</form>
+
+<p><a href="/">Back to login</a></p>
 
 </div>
 </div>
-
 </body>
 </html>
-`)
-
+`, captchaHTML(captchaID))
 		return
 	}
 
-	if password != confirmPassword {
-		fmt.Fprintln(w, pageStart("Reset Password"))
+	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 
-		fmt.Fprintln(w, `
-<div class="container">
-<div class="card">
-
-<div class="error">
-The passwords do not match.
-</div>
-
-<a href="/forgot-password">
-<button>Try Again</button>
-</a>
-
-</div>
-</div>
-
-</body>
-</html>
-`)
-
+	if !verifyCaptcha(r.FormValue("captchaID"), r.FormValue("captcha")) {
+		renderError(w, "Security Check Failed", "Incorrect or expired CAPTCHA. Please try again.", "/forgot-password")
 		return
 	}
 
-	if !validPassword(password) {
-		fmt.Fprintln(w, pageStart("Reset Password"))
+	mu.Lock()
+	account := (*Account)(nil)
+	for i := range accounts {
+		if strings.EqualFold(accounts[i].Email, email) {
+			account = &accounts[i]
+			break
+		}
+	}
 
+	if account == nil {
+		mu.Unlock()
+		// Don't reveal whether an email exists.
+		fmt.Fprintln(w, pageStart("Check Your Email"))
 		fmt.Fprintln(w, `
+<div class="container"><div class="card">
+<div class="success">
+<h2>Check your email</h2>
+<p>If an account exists for that email, a password-reset link has been sent.</p>
+</div>
+<a href="/"><button>Back to Login</button></a>
+</div></div>
+</body></html>
+`)
+		return
+	}
+
+	token := randomToken()
+	if token == "" {
+		mu.Unlock()
+		renderError(w, "Error", "Unable to create reset link. Please try again.", "/forgot-password")
+		return
+	}
+	resetTokens[token] = account.Username
+	mu.Unlock()
+
+	resetURL := baseURL() + "/reset-password?token=" + token
+	body := fmt.Sprintf(
+		"Hello %s,\n\nA password reset was requested for your Caleb's City Mall Bank account.\n\nReset your password here:\n%s\n\nThis link is for your account only. If you did not request this, ignore this email.",
+		account.Name, resetURL,
+	)
+
+	if err := sendEmail(email, "Reset your Caleb's City Mall Bank password", body); err != nil {
+		mu.Lock()
+		delete(resetTokens, token)
+		mu.Unlock()
+		renderError(w, "Email Error", "We could not send the reset email. Check the email service configuration and try again.", "/forgot-password")
+		return
+	}
+
+	fmt.Fprintln(w, pageStart("Check Your Email"))
+	fmt.Fprintln(w, `
+<div class="container"><div class="card">
+<div class="success">
+<h2>Check Your Email 📧</h2>
+<p>If the email belongs to an account, a password-reset link has been sent.</p>
+</div>
+<a href="/"><button>Back to Login</button></a>
+</div></div>
+</body></html>
+`)
+}
+
+func resetPasswordPage(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.URL.Query().Get("token"))
+
+	mu.Lock()
+	username := resetTokens[token]
+	account := findAccount(username)
+	valid := token != "" && username != "" && account != nil
+	mu.Unlock()
+
+	if !valid {
+		renderError(w, "Reset Link Invalid", "This password-reset link is invalid or has already been used.", "/forgot-password")
+		return
+	}
+
+	captchaID := newCaptcha()
+
+	fmt.Fprintln(w, pageStart("Reset Password"))
+	fmt.Fprintf(w, `
 <div class="container">
 <div class="card">
 
-<div class="error">
+<h1>🔑 Reset Password</h1>
 
-<strong>Password does not meet the requirements.</strong>
+<form action="/reset-password" method="POST">
 
+<input type="hidden" name="token" value="%s">
+
+<label>New Password</label>
+<div style="display:flex; gap:8px;">
+<input id="resetPassword" type="password" name="password" required autocomplete="new-password">
+<button type="button" class="show-password" onclick="toggleField('resetPassword', this)">Show</button>
+</div>
+
+<label>Confirm New Password</label>
+<div style="display:flex; gap:8px;">
+<input id="resetConfirm" type="password" name="confirmPassword" required autocomplete="new-password">
+<button type="button" class="show-password" onclick="toggleField('resetConfirm', this)">Show</button>
+</div>
+
+<div class="info">
+<strong>Password requirements:</strong>
 <ul>
 <li>At least 8 characters</li>
 <li>1 uppercase letter</li>
@@ -1296,94 +1274,94 @@ The passwords do not match.
 <li>1 number</li>
 <li>1 symbol</li>
 </ul>
-
 </div>
 
-<a href="/forgot-password">
-<button>Try Again</button>
-</a>
+%s
+
+<button type="submit">Reset Password</button>
+</form>
 
 </div>
 </div>
+
+<script>
+function toggleField(id, button) {
+	const field = document.getElementById(id);
+	if (field.type === "password") {
+		field.type = "text";
+		button.textContent = "Hide";
+	} else {
+		field.type = "password";
+		button.textContent = "Show";
+	}
+}
+</script>
 
 </body>
 </html>
-`)
+`,
+		template.HTMLEscapeString(token),
+		captchaHTML(captchaID),
+	)
+}
 
+func resetPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token := strings.TrimSpace(r.FormValue("token"))
+	password := r.FormValue("password")
+	confirmPassword := r.FormValue("confirmPassword")
+
+	if !verifyCaptcha(r.FormValue("captchaID"), r.FormValue("captcha")) {
+		renderError(w, "Security Check Failed", "Incorrect or expired CAPTCHA. Please try again.", "/forgot-password")
+		return
+	}
+
+	if password != confirmPassword {
+		renderError(w, "Reset Password", "The passwords do not match.", "/forgot-password")
+		return
+	}
+
+	if !validPassword(password) {
+		renderError(w, "Reset Password", "Password does not meet the requirements.", "/forgot-password")
 		return
 	}
 
 	mu.Lock()
-
+	username := resetTokens[token]
 	account := findAccount(username)
 
-	if account == nil || account.AccountNo != accountNumber {
+	if token == "" || username == "" || account == nil {
 		mu.Unlock()
-
-		fmt.Fprintln(w, pageStart("Reset Password"))
-
-		fmt.Fprintln(w, `
-<div class="container">
-<div class="card">
-
-<div class="error">
-The account could not be verified. Please start again.
-</div>
-
-<a href="/forgot-password">
-<button>Start Again</button>
-</a>
-
-</div>
-</div>
-
-</body>
-</html>
-`)
-
+		renderError(w, "Reset Link Invalid", "This password-reset link is invalid or has already been used.", "/forgot-password")
 		return
 	}
 
 	account.PasswordHash = hashPassword(password)
 
-	// Invalidate all existing login sessions for this account.
 	for sessionID, sessionUsername := range sessions {
 		if sessionUsername == username {
 			delete(sessions, sessionID)
 		}
 	}
 
+	delete(resetTokens, token)
 	persistLocked()
-
 	mu.Unlock()
 
 	fmt.Fprintln(w, pageStart("Password Reset"))
-
 	fmt.Fprintln(w, `
-<div class="container">
-
-<div class="card">
-
+<div class="container"><div class="card">
 <div class="success">
-
 <h1>Password Reset Successful! ✅</h1>
-
-<p>Your password has been changed successfully.</p>
-
-<p>For your security, any previous login sessions have been signed out.</p>
-
+<p>Your password has been changed. Any previous login sessions have been signed out.</p>
 </div>
-
-<a href="/">
-<button>Go to Login</button>
-</a>
-
-</div>
-
-</div>
-
-</body>
-</html>
+<a href="/"><button>Go to Login</button></a>
+</div></div>
+</body></html>
 `)
 }
 
@@ -1392,33 +1370,41 @@ The account could not be verified. Please start again.
 // ----------------------------------------------------
 
 func login(w http.ResponseWriter, r *http.Request) {
-
-	username := strings.TrimSpace(
-		r.FormValue("username"),
-	)
-
-	password := r.FormValue("password")
-
-	mu.Lock()
-
-	account := findAccount(username)
-
-	if account == nil ||
-		account.PasswordHash != hashPassword(password) {
-
-		mu.Unlock()
-
-		loginPage(w, `
-<div class="error">
-Invalid username or password.
-</div>
-`)
-
+	if r.Method != "POST" {
+		loginPage(w, "")
 		return
 	}
 
-	sessionID := createSession(username)
+	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
+	password := r.FormValue("password")
 
+	if !verifyCaptcha(r.FormValue("captchaID"), r.FormValue("captcha")) {
+		loginPage(w, `<div class="error">Incorrect or expired CAPTCHA. Please try again.</div>`)
+		return
+	}
+
+	mu.Lock()
+	account := (*Account)(nil)
+	for i := range accounts {
+		if strings.EqualFold(accounts[i].Email, email) {
+			account = &accounts[i]
+			break
+		}
+	}
+
+	if account == nil || account.PasswordHash != hashPassword(password) {
+		mu.Unlock()
+		loginPage(w, `<div class="error">Invalid email or password.</div>`)
+		return
+	}
+
+	if !account.Verified {
+		mu.Unlock()
+		loginPage(w, `<div class="error">Please verify your email before signing in.</div>`)
+		return
+	}
+
+	sessionID := createSession(account.Username)
 	mu.Unlock()
 
 	http.SetCookie(w, &http.Cookie{
@@ -1430,16 +1416,13 @@ Invalid username or password.
 		Path:     "/",
 	})
 
-	http.Redirect(
-		w,
-		r,
-		"/",
-		http.StatusSeeOther,
-	)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // ----------------------------------------------------
 // SEND PAGE
+// ----------------------------------------------------
+
 // ----------------------------------------------------
 
 func sendPage(w http.ResponseWriter, r *http.Request) {
@@ -2253,105 +2236,329 @@ Please sign in first.
 // ----------------------------------------------------
 
 func profilePage(w http.ResponseWriter, r *http.Request) {
-
 	username := getLoggedInUser(r)
-
 	if username == "" {
-
-		loginPage(w, `
-<div class="error">
-Please sign in first.
-</div>
-`)
-
+		loginPage(w, `<div class="error">Please sign in first.</div>`)
 		return
 	}
 
 	mu.Lock()
-
 	account := findAccount(username)
-
 	if account == nil {
-
 		mu.Unlock()
-
-		fmt.Fprintln(
-			w,
-			"Account not found.",
-		)
-
+		fmt.Fprintln(w, "Account not found.")
 		return
 	}
 
 	name := account.Name
 	user := account.Username
+	email := account.Email
 	number := account.AccountNo
 	currency := account.Currency
 	balance := account.Balance
-
 	mu.Unlock()
 
 	fmt.Fprintln(w, pageStart("Profile"))
 
 	fmt.Fprintf(w, `
-
 <div class="container">
-
 <div class="card">
 
 <h1>👤 My Profile</h1>
 
-<p>
-<strong>Name:</strong> %s
-</p>
+<p><strong>Name:</strong> %s</p>
+<p><strong>Username:</strong> %s</p>
+<p><strong>Email:</strong> %s</p>
 
-<p>
-<strong>Username:</strong> %s
-</p>
+<p><strong>Account Number:</strong></p>
+<div class="account-number">%s</div>
 
-<p>
-<strong>Account Number:</strong>
-</p>
-
-<div class="account-number">
-%s
-</div>
-
-<p>
-<strong>Currency:</strong> %s
-</p>
-
-<p>
-<strong>Balance:</strong>
-%.2f %s
-</p>
+<p><strong>Currency:</strong> %s</p>
+<p><strong>Balance:</strong> %.2f %s</p>
 
 <hr>
 
-<p>
-<strong>Password:</strong>
-••••••••
-</p>
+<p><strong>Password:</strong> ••••••••</p>
+<p>Your password is never stored in readable form.</p>
 
-<p>
-Your password is securely stored and cannot be displayed.
-</p>
+<a href="/change-password"><button>Change Password</button></a>
+<a href="/change-currency"><button>Change Currency</button></a>
 
 </div>
-
 </div>
 
 </body>
 </html>
-
 `,
 		template.HTMLEscapeString(name),
 		template.HTMLEscapeString(user),
+		template.HTMLEscapeString(email),
 		template.HTMLEscapeString(number),
 		template.HTMLEscapeString(currency),
 		balance,
 		template.HTMLEscapeString(currency),
 	)
+}
+
+// ----------------------------------------------------
+// CHANGE PASSWORD
+// ----------------------------------------------------
+
+// ----------------------------------------------------
+
+func changePasswordPage(w http.ResponseWriter, r *http.Request) {
+	username := getLoggedInUser(r)
+	if username == "" {
+		loginPage(w, `<div class="error">Please sign in first.</div>`)
+		return
+	}
+
+	captchaID := newCaptcha()
+
+	fmt.Fprintln(w, pageStart("Change Password"))
+	fmt.Fprintf(w, `
+<div class="container">
+<div class="card">
+
+<h1>🔑 Change Password</h1>
+
+<form action="/change-password" method="POST">
+
+<label>Current Password</label>
+<div style="display:flex; gap:8px;">
+<input id="currentPassword" type="password" name="currentPassword" required>
+<button type="button" class="show-password" onclick="toggleField('currentPassword', this)">Show</button>
+</div>
+
+<label>New Password</label>
+<div style="display:flex; gap:8px;">
+<input id="newPassword" type="password" name="newPassword" required>
+<button type="button" class="show-password" onclick="toggleField('newPassword', this)">Show</button>
+</div>
+
+<label>Confirm New Password</label>
+<div style="display:flex; gap:8px;">
+<input id="confirmPassword" type="password" name="confirmPassword" required>
+<button type="button" class="show-password" onclick="toggleField('confirmPassword', this)">Show</button>
+</div>
+
+<div class="info">
+<strong>Password requirements:</strong>
+<ul>
+<li>At least 8 characters</li>
+<li>1 uppercase letter</li>
+<li>1 lowercase letter</li>
+<li>1 number</li>
+<li>1 symbol</li>
+</ul>
+</div>
+
+%s
+
+<button type="submit">Change Password</button>
+</form>
+
+</div>
+</div>
+
+<script>
+function toggleField(id, button) {
+	const field = document.getElementById(id);
+	if (field.type === "password") {
+		field.type = "text";
+		button.textContent = "Hide";
+	} else {
+		field.type = "password";
+		button.textContent = "Show";
+	}
+}
+</script>
+
+</body>
+</html>
+`, captchaHTML(captchaID))
+}
+
+func changePassword(w http.ResponseWriter, r *http.Request) {
+	username := getLoggedInUser(r)
+	if username == "" {
+		loginPage(w, `<div class="error">Please sign in first.</div>`)
+		return
+	}
+
+	if !verifyCaptcha(r.FormValue("captchaID"), r.FormValue("captcha")) {
+		renderError(w, "Security Check Failed", "Incorrect or expired CAPTCHA. Please try again.", "/change-password")
+		return
+	}
+
+	current := r.FormValue("currentPassword")
+	newPassword := r.FormValue("newPassword")
+	confirm := r.FormValue("confirmPassword")
+
+	if newPassword != confirm {
+		renderError(w, "Change Password", "The new passwords do not match.", "/change-password")
+		return
+	}
+
+	if !validPassword(newPassword) {
+		renderError(w, "Change Password", "Password does not meet the requirements.", "/change-password")
+		return
+	}
+
+	mu.Lock()
+	account := findAccount(username)
+	if account == nil || account.PasswordHash != hashPassword(current) {
+		mu.Unlock()
+		renderError(w, "Change Password", "Your current password is incorrect.", "/change-password")
+		return
+	}
+
+	account.PasswordHash = hashPassword(newPassword)
+	persistLocked()
+	mu.Unlock()
+
+	fmt.Fprintln(w, pageStart("Password Changed"))
+	fmt.Fprintln(w, `
+<div class="container"><div class="card">
+<div class="success">
+<h1>Password Changed! ✅</h1>
+<p>Your password has been updated successfully.</p>
+</div>
+<a href="/"><button>Back to Dashboard</button></a>
+</div></div>
+</body></html>
+`)
+}
+
+// ----------------------------------------------------
+// CHANGE CURRENCY
+// ----------------------------------------------------
+
+func changeCurrencyPage(w http.ResponseWriter, r *http.Request) {
+	username := getLoggedInUser(r)
+	if username == "" {
+		loginPage(w, `<div class="error">Please sign in first.</div>`)
+		return
+	}
+
+	mu.Lock()
+	account := findAccount(username)
+	if account == nil {
+		mu.Unlock()
+		loginPage(w, `<div class="error">Account not found.</div>`)
+		return
+	}
+	currentCurrency := account.Currency
+	mu.Unlock()
+
+	fmt.Fprintln(w, pageStart("Change Currency"))
+	fmt.Fprintf(w, `
+<div class="container"><div class="card">
+
+<h1>💱 Change Account Currency</h1>
+<p>Current currency: <strong>%s</strong></p>
+<p>Your balance will be converted using the current exchange rate.</p>
+
+<form action="/change-currency" method="POST">
+
+<label>New Currency</label>
+<select name="currency">
+<option value="USD">USD - US Dollar</option>
+<option value="EUR">EUR - Euro</option>
+<option value="GBP">GBP - British Pound</option>
+<option value="JPY">JPY - Japanese Yen</option>
+<option value="NGN">NGN - Nigerian Naira</option>
+<option value="CAD">CAD - Canadian Dollar</option>
+<option value="AUD">AUD - Australian Dollar</option>
+<option value="CHF">CHF - Swiss Franc</option>
+</select>
+
+<button type="submit">Change Currency</button>
+</form>
+
+</div></div>
+</body></html>
+`, template.HTMLEscapeString(currentCurrency))
+}
+
+func changeCurrency(w http.ResponseWriter, r *http.Request) {
+	username := getLoggedInUser(r)
+	if username == "" {
+		loginPage(w, `<div class="error">Please sign in first.</div>`)
+		return
+	}
+
+	newCurrency := strings.ToUpper(strings.TrimSpace(r.FormValue("currency")))
+
+	valid := false
+	for _, c := range currencies {
+		if c == newCurrency {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		renderError(w, "Currency Error", "Invalid currency.", "/change-currency")
+		return
+	}
+
+	mu.Lock()
+	account := findAccount(username)
+	if account == nil {
+		mu.Unlock()
+		renderError(w, "Error", "Account not found.", "/change-currency")
+		return
+	}
+	oldCurrency := account.Currency
+	oldBalance := account.Balance
+	mu.Unlock()
+
+	if oldCurrency == newCurrency {
+		http.Redirect(w, r, "/profile", http.StatusSeeOther)
+		return
+	}
+
+	rate, err := getExchangeRate(oldCurrency, newCurrency)
+	if err != nil {
+		renderError(w, "Currency Error", "Unable to get the exchange rate. Please try again later.", "/change-currency")
+		return
+	}
+
+	newBalance := oldBalance * rate
+
+	mu.Lock()
+	account = findAccount(username)
+	if account == nil {
+		mu.Unlock()
+		renderError(w, "Error", "Account not found.", "/change-currency")
+		return
+	}
+	account.Balance = newBalance
+	account.Currency = newCurrency
+
+	transactions[username] = append(transactions[username], Transaction{
+		Type:     "Currency Change",
+		Amount:   newBalance,
+		Currency: newCurrency,
+		Details:  fmt.Sprintf("Account currency changed from %s to %s. Balance converted using the current exchange rate.", oldCurrency, newCurrency),
+		Date:     time.Now().Format("02 Jan 2006, 15:04"),
+	})
+
+	persistLocked()
+	mu.Unlock()
+
+	fmt.Fprintln(w, pageStart("Currency Changed"))
+	fmt.Fprintf(w, `
+<div class="container"><div class="card">
+<div class="success">
+<h1>Currency Changed! ✅</h1>
+<p>Your account currency is now <strong>%s</strong>.</p>
+<p>New balance: <strong>%.2f %s</strong></p>
+</div>
+<a href="/profile"><button>Back to Profile</button></a>
+</div></div>
+</body></html>
+`, template.HTMLEscapeString(newCurrency), newBalance, template.HTMLEscapeString(newCurrency))
 }
 
 // ----------------------------------------------------
@@ -2458,10 +2665,8 @@ func createTestAccounts() error {
 			firstNames[i%len(firstNames)]
 
 		last :=
-			lastNames[
-				(i/len(firstNames))%
-					len(lastNames),
-			]
+			lastNames[(i/len(firstNames))%
+				len(lastNames)]
 
 		name :=
 			fmt.Sprintf(
@@ -2483,9 +2688,7 @@ func createTestAccounts() error {
 			)
 
 		currency :=
-			currencies[
-				i%len(currencies),
-			]
+			currencies[i%len(currencies)]
 
 		accountNumber :=
 			generateAccountNumber()
@@ -2499,7 +2702,9 @@ func createTestAccounts() error {
 				Account{
 					Name:         name,
 					Username:     username,
+					Email:        username + "@example.com",
 					PasswordHash: hashPassword(password),
+					Verified:     true,
 					AccountNo:    accountNumber,
 					Currency:     currency,
 					Balance:      balance,
@@ -2560,7 +2765,7 @@ func main() {
 		fmt.Println("")
 		fmt.Println("TEST LOGIN")
 		fmt.Println("------------------------------")
-		fmt.Println("Username: customer0001")
+		fmt.Println("Email: customer0001@example.com")
 		fmt.Println("Password: BankUser0001!")
 		fmt.Println("------------------------------")
 	}
@@ -2569,8 +2774,31 @@ func main() {
 
 	http.HandleFunc("/register", registerPage)
 	http.HandleFunc("/login", login)
+	http.HandleFunc("/verify-email", verifyEmail)
 	http.HandleFunc("/forgot-password", forgotPasswordPage)
-	http.HandleFunc("/reset-password", resetPassword)
+	http.HandleFunc("/reset-password", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			resetPasswordPage(w, r)
+		} else {
+			resetPassword(w, r)
+		}
+	})
+
+	http.HandleFunc("/change-password", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			changePasswordPage(w, r)
+		} else {
+			changePassword(w, r)
+		}
+	})
+
+	http.HandleFunc("/change-currency", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			changeCurrencyPage(w, r)
+		} else {
+			changeCurrency(w, r)
+		}
+	})
 
 	http.HandleFunc("/send", sendPage)
 	http.HandleFunc("/send-money", sendMoney)
