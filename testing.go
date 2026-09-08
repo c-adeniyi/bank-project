@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,19 +20,26 @@ type Account struct {
 	Username     string
 	PasswordHash string
 	AccountNo    string
+	Currency     string
 	Balance      float64
 }
 
 type Transaction struct {
-	Type    string
-	Amount  float64
-	Details string
-	Date    string
+	Type     string
+	Amount   float64
+	Currency string
+	Details  string
+	Date     string
+}
+
+type RateResponse struct {
+	Rate float64 `json:"rate"`
 }
 
 type SearchResult struct {
 	Name      string `json:"name"`
 	AccountNo string `json:"accountNo"`
+	Currency  string `json:"currency"`
 }
 
 var (
@@ -40,55 +49,93 @@ var (
 	mu           sync.Mutex
 )
 
-// ---------- PASSWORD ----------
+var currencies = []string{
+	"USD",
+	"EUR",
+	"GBP",
+	"JPY",
+	"NGN",
+	"CAD",
+	"AUD",
+	"CHF",
+}
+
+// ----------------------------------------------------
+// PASSWORD
+// ----------------------------------------------------
 
 func hashPassword(password string) string {
 	hash := sha256.Sum256([]byte(password))
 	return fmt.Sprintf("%x", hash)
 }
 
-// ---------- ACCOUNT NUMBER ----------
+func validPassword(password string) bool {
+	if len(password) < 8 {
+		return false
+	}
+
+	var upper, lower, number, symbol bool
+
+	for _, c := range password {
+		switch {
+		case c >= 'A' && c <= 'Z':
+			upper = true
+		case c >= 'a' && c <= 'z':
+			lower = true
+		case c >= '0' && c <= '9':
+			number = true
+		default:
+			symbol = true
+		}
+	}
+
+	return upper && lower && number && symbol
+}
+
+// ----------------------------------------------------
+// ACCOUNT NUMBERS
+// ----------------------------------------------------
 
 func generateAccountNumber() string {
 	for {
-		b := make([]byte, 4)
+		b := make([]byte, 8)
 
-		_, err := rand.Read(b)
-		if err != nil {
+		if _, err := rand.Read(b); err != nil {
 			continue
 		}
 
-		number := 1000000000 + int(
-			uint32(b[0])<<24|
-				uint32(b[1])<<16|
-				uint32(b[2])<<8|
-				uint32(b[3]),
-		)%900000000
+		number := uint64(0)
 
-		accountNumber := strconv.Itoa(number)
+		for _, x := range b {
+			number = number*256 + uint64(x)
+		}
+
+		number = 1000000000 + number%9000000000
+		result := strconv.FormatUint(number, 10)
 
 		exists := false
 
 		for _, account := range accounts {
-			if account.AccountNo == accountNumber {
+			if account.AccountNo == result {
 				exists = true
 				break
 			}
 		}
 
 		if !exists {
-			return accountNumber
+			return result
 		}
 	}
 }
 
-// ---------- SESSIONS ----------
+// ----------------------------------------------------
+// SESSIONS
+// ----------------------------------------------------
 
 func createSession(username string) string {
 	b := make([]byte, 32)
 
-	_, err := rand.Read(b)
-	if err != nil {
+	if _, err := rand.Read(b); err != nil {
 		return ""
 	}
 
@@ -100,6 +147,7 @@ func createSession(username string) string {
 
 func getLoggedInUser(r *http.Request) string {
 	cookie, err := r.Cookie("session")
+
 	if err != nil {
 		return ""
 	}
@@ -110,7 +158,9 @@ func getLoggedInUser(r *http.Request) string {
 	return sessions[cookie.Value]
 }
 
-// ---------- FIND ACCOUNTS ----------
+// ----------------------------------------------------
+// ACCOUNT SEARCH
+// ----------------------------------------------------
 
 func findAccount(username string) *Account {
 	for i := range accounts {
@@ -132,15 +182,67 @@ func findAccountByNumber(number string) *Account {
 	return nil
 }
 
-// ---------- HEADER ----------
+// ----------------------------------------------------
+// CURRENCY
+// ----------------------------------------------------
+
+func getExchangeRate(from, to string) (float64, error) {
+	if from == to {
+		return 1, nil
+	}
+
+	url := fmt.Sprintf(
+		"https://api.frankfurter.dev/v2/rate/%s/%s",
+		from,
+		to,
+	)
+
+	response, err := http.Get(url)
+
+	if err != nil {
+		return 0, err
+	}
+
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("exchange rate unavailable")
+	}
+
+	body, err := io.ReadAll(response.Body)
+
+	if err != nil {
+		return 0, err
+	}
+
+	var data RateResponse
+
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, err
+	}
+
+	if data.Rate <= 0 {
+		return 0, fmt.Errorf("invalid exchange rate")
+	}
+
+	return data.Rate, nil
+}
+
+// ----------------------------------------------------
+// PAGE HEADER
+// ----------------------------------------------------
 
 func pageStart(title string) string {
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
 <title>%s - Caleb's City Mall Bank</title>
 
 <style>
+
 * {
 	box-sizing: border-box;
 }
@@ -153,9 +255,9 @@ body {
 }
 
 .navbar {
-	background: linear-gradient(135deg, #4b2aad, #1769e0);
+	background: linear-gradient(135deg, #5429c7, #1769e0);
 	color: white;
-	padding: 18px 7%%;
+	padding: 18px 6%%;
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
@@ -163,14 +265,14 @@ body {
 }
 
 .logo {
-	font-size: 22px;
+	font-size: 21px;
 	font-weight: bold;
 }
 
 .navbar a {
 	color: white;
 	text-decoration: none;
-	margin-left: 18px;
+	margin-left: 15px;
 }
 
 .container {
@@ -181,36 +283,42 @@ body {
 
 .card {
 	background: white;
-	padding: 25px;
+	padding: 28px;
 	margin-bottom: 25px;
-	border-radius: 15px;
-	box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+	border-radius: 16px;
+	box-shadow: 0 5px 20px rgba(0,0,0,.08);
 }
 
 .hero {
-	background: linear-gradient(135deg, #4b2aad, #1769e0);
+	background: linear-gradient(135deg, #5429c7, #1769e0);
 	color: white;
-	padding: 40px;
+	padding: 35px;
 	border-radius: 18px;
 	margin-bottom: 25px;
 }
 
 .balance {
-	font-size: 38px;
+	font-size: 36px;
 	font-weight: bold;
-	margin-top: 10px;
 }
 
 .account-number {
 	background: #eef2ff;
 	padding: 15px;
 	border-radius: 10px;
-	font-size: 20px;
+	font-size: 19px;
 	font-weight: bold;
 	letter-spacing: 2px;
 }
 
-input {
+.grid {
+	display: grid;
+	grid-template-columns: repeat(2, 1fr);
+	gap: 20px;
+}
+
+input,
+select {
 	width: 100%%;
 	padding: 13px;
 	margin: 8px 0 15px;
@@ -220,7 +328,7 @@ input {
 }
 
 button {
-	background: linear-gradient(135deg, #4b2aad, #1769e0);
+	background: linear-gradient(135deg, #5429c7, #1769e0);
 	color: white;
 	border: none;
 	padding: 13px 20px;
@@ -230,13 +338,7 @@ button {
 }
 
 button:hover {
-	opacity: 0.9;
-}
-
-.grid {
-	display: grid;
-	grid-template-columns: repeat(2, 1fr);
-	gap: 20px;
+	opacity: .9;
 }
 
 .success {
@@ -250,6 +352,14 @@ button:hover {
 .error {
 	background: #fee2e2;
 	color: #991b1b;
+	padding: 15px;
+	border-radius: 8px;
+	margin-bottom: 15px;
+}
+
+.info {
+	background: #dbeafe;
+	color: #1e40af;
 	padding: 15px;
 	border-radius: 8px;
 	margin-bottom: 15px;
@@ -290,6 +400,7 @@ button:hover {
 }
 
 @media (max-width: 700px) {
+
 	.grid {
 		grid-template-columns: 1fr;
 	}
@@ -298,7 +409,13 @@ button:hover {
 		flex-direction: column;
 		gap: 12px;
 	}
+
+	.navbar a {
+		margin-left: 5px;
+	}
+
 }
+
 </style>
 
 </head>
@@ -312,7 +429,7 @@ button:hover {
 </div>
 
 <div>
-<a href="/">Dashboard</a>
+<a href="/">Home</a>
 <a href="/send">Send</a>
 <a href="/withdraw">Withdraw</a>
 <a href="/transactions">Transactions</a>
@@ -324,50 +441,12 @@ button:hover {
 `, title)
 }
 
-// ---------- LOGIN PAGE ----------
-
-func loginPage(w http.ResponseWriter, message string) {
-	fmt.Fprintln(w, pageStart("Login"))
-
-	fmt.Fprintf(w, `
-<div class="container">
-
-<div class="card">
-
-<h1>Welcome Back 👋</h1>
-
-<p>Sign in to Caleb's City Mall Bank.</p>
-
-%s
-
-<form action="/login" method="POST">
-
-<label>Username</label>
-<input type="text" name="username" required>
-
-<label>Password</label>
-<input type="password" name="password" required>
-
-<button type="submit">Sign In</button>
-
-</form>
-
-<p>
-Don't have an account?
-<a href="/register">Create an account</a>
-</p>
-
-</div>
-</div>
-
-</body>
-</html>
-`, message)
-}
-
-// ---------- DASHBOARD ----------
+// ----------------------------------------------------
+// HOME
+// ----------------------------------------------------
 
 func home(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
@@ -386,7 +465,8 @@ func home(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := account.Name
-	accountNo := account.AccountNo
+	number := account.AccountNo
+	currency := account.Currency
 	balance := account.Balance
 
 	mu.Unlock()
@@ -394,18 +474,17 @@ func home(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, pageStart("Dashboard"))
 
 	fmt.Fprintf(w, `
+
 <div class="container">
 
 <div class="hero">
 
 <h1>Welcome, %s! 👋</h1>
 
-<p>Caleb's City Mall Bank</p>
-
 <p>Available Balance</p>
 
 <div class="balance">
-$%.2f
+%.2f %s
 </div>
 
 </div>
@@ -414,7 +493,7 @@ $%.2f
 
 <div class="card">
 
-<h2>💳 Your Account</h2>
+<h2>💳 Account</h2>
 
 <p>Account Number:</p>
 
@@ -422,9 +501,7 @@ $%.2f
 %s
 </div>
 
-<p>
-Use this number when another customer wants to send you money.
-</p>
+<p>Currency: <strong>%s</strong></p>
 
 </div>
 
@@ -432,7 +509,7 @@ Use this number when another customer wants to send you money.
 
 <h2>📤 Send Money</h2>
 
-<p>Transfer money to another customer.</p>
+<p>Send money in any supported currency.</p>
 
 <a href="/send">
 <button>Send Money</button>
@@ -456,7 +533,7 @@ Use this number when another customer wants to send you money.
 
 <h2>📜 Transactions</h2>
 
-<p>View your banking activity.</p>
+<p>View all your banking activity.</p>
 
 <a href="/transactions">
 <button>View Transactions</button>
@@ -465,44 +542,156 @@ Use this number when another customer wants to send you money.
 </div>
 
 </div>
+
 </div>
 
 </body>
 </html>
+
 `,
 		template.HTMLEscapeString(name),
 		balance,
-		template.HTMLEscapeString(accountNo),
+		currency,
+		number,
+		currency,
 	)
 }
 
-// ---------- REGISTER ----------
+// ----------------------------------------------------
+// LOGIN PAGE
+// ----------------------------------------------------
 
-func registerPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		fmt.Fprintln(w, pageStart("Register"))
+func loginPage(w http.ResponseWriter, message string) {
 
-		fmt.Fprintln(w, `
+	fmt.Fprintln(w, pageStart("Login"))
+
+	fmt.Fprintf(w, `
+
 <div class="container">
 
 <div class="card">
 
-<h1>🏦 Create Your Account</h1>
+<h1>Welcome Back 👋</h1>
 
-<p>Join Caleb's City Mall Bank.</p>
+<p>Sign in to Caleb's City Mall Bank.</p>
+
+%s
+
+<form action="/login" method="POST">
+
+<label>Username</label>
+
+<input
+type="text"
+name="username"
+required
+>
+
+<label>Password</label>
+
+<input
+type="password"
+name="password"
+required
+>
+
+<button type="submit">
+Sign In
+</button>
+
+</form>
+
+<p>
+Don't have an account?
+<a href="/register">Create an account</a>
+</p>
+
+</div>
+
+</div>
+
+</body>
+</html>
+
+`, message)
+}
+
+// ----------------------------------------------------
+// REGISTER
+// ----------------------------------------------------
+
+func registerPage(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method == "GET" {
+
+		fmt.Fprintln(w, pageStart("Register"))
+
+		fmt.Fprintln(w, `
+
+<div class="container">
+
+<div class="card">
+
+<h1>🏦 Create Account</h1>
 
 <form action="/register" method="POST">
 
 <label>Full Name</label>
-<input type="text" name="name" placeholder="Enter your name" required>
+
+<input
+type="text"
+name="name"
+required
+>
 
 <label>Username</label>
-<input type="text" name="username" placeholder="Choose a username" required>
+
+<input
+type="text"
+name="username"
+required
+>
 
 <label>Password</label>
-<input type="password" name="password" placeholder="Create a password" required>
 
-<button type="submit">Create Account</button>
+<input
+type="password"
+name="password"
+required
+>
+
+<div class="info">
+
+<strong>Password requirements:</strong>
+
+<ul>
+<li>At least 8 characters</li>
+<li>1 uppercase letter</li>
+<li>1 lowercase letter</li>
+<li>1 number</li>
+<li>1 symbol</li>
+</ul>
+
+</div>
+
+<label>Currency</label>
+
+<select name="currency">
+
+<option value="USD">USD - US Dollar</option>
+<option value="EUR">EUR - Euro</option>
+<option value="GBP">GBP - British Pound</option>
+<option value="JPY">JPY - Japanese Yen</option>
+<option value="NGN">NGN - Nigerian Naira</option>
+<option value="CAD">CAD - Canadian Dollar</option>
+<option value="AUD">AUD - Australian Dollar</option>
+<option value="CHF">CHF - Swiss Franc</option>
+
+</select>
+
+<button type="submit">
+Create Account
+</button>
 
 </form>
 
@@ -512,10 +701,12 @@ Already have an account?
 </p>
 
 </div>
+
 </div>
 
 </body>
 </html>
+
 `)
 
 		return
@@ -524,62 +715,181 @@ Already have an account?
 	name := strings.TrimSpace(r.FormValue("name"))
 	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
+	currency := strings.ToUpper(r.FormValue("currency"))
 
 	if name == "" || username == "" || password == "" {
 		fmt.Fprintln(w, "Please complete all fields.")
 		return
 	}
 
+	validCurrency := false
+
+	for _, c := range currencies {
+		if currency == c {
+			validCurrency = true
+			break
+		}
+	}
+
+	if !validCurrency {
+		fmt.Fprintln(w, "Invalid currency.")
+		return
+	}
+
+	if !validPassword(password) {
+
+		fmt.Fprintln(w, pageStart("Password Error"))
+
+		fmt.Fprintln(w, `
+
+<div class="container">
+
+<div class="card">
+
+<div class="error">
+
+<strong>Password does not meet the requirements.</strong>
+
+<ul>
+<li>At least 8 characters</li>
+<li>1 uppercase letter</li>
+<li>1 lowercase letter</li>
+<li>1 number</li>
+<li>1 symbol</li>
+</ul>
+
+</div>
+
+<a href="/register">
+<button>Try Again</button>
+</a>
+
+</div>
+
+</div>
+
+</body>
+</html>
+
+`)
+
+		return
+	}
+
 	mu.Lock()
-	defer mu.Unlock()
 
 	if findAccount(username) != nil {
+		mu.Unlock()
+
+		fmt.Fprintln(w, pageStart("Error"))
+
 		fmt.Fprintln(w, `
-<h1>Registration Failed</h1>
-<p>That username already exists.</p>
-<a href="/register">Try Again</a>
+
+<div class="container">
+
+<div class="card">
+
+<div class="error">
+That username already exists.
+</div>
+
+<a href="/register">
+<button>Try Again</button>
+</a>
+
+</div>
+
+</div>
+
+</body>
+</html>
+
 `)
+
 		return
 	}
 
 	accountNumber := generateAccountNumber()
 
-	account := Account{
+	mu.Unlock()
+
+	rate, err := getExchangeRate("USD", currency)
+
+	if err != nil {
+
+		fmt.Fprintln(w, pageStart("Error"))
+
+		fmt.Fprintln(w, `
+
+<div class="container">
+
+<div class="card">
+
+<div class="error">
+Unable to get the exchange rate.
+Please try again later.
+</div>
+
+<a href="/register">
+<button>Try Again</button>
+</a>
+
+</div>
+
+</div>
+
+</body>
+</html>
+
+`)
+
+		return
+	}
+
+	startingBalance := 1000 * rate
+
+	mu.Lock()
+
+	accounts = append(accounts, Account{
 		Name:         name,
 		Username:     username,
 		PasswordHash: hashPassword(password),
 		AccountNo:    accountNumber,
-		Balance:      1000,
-	}
+		Currency:     currency,
+		Balance:      startingBalance,
+	})
 
-	accounts = append(accounts, account)
+	mu.Unlock()
 
 	fmt.Fprintln(w, pageStart("Account Created"))
 
 	fmt.Fprintf(w, `
+
 <div class="container">
 
 <div class="card">
 
 <div class="success">
-<h1>Account Created Successfully! 🎉</h1>
+
+<h1>Account Created! 🎉</h1>
+
 </div>
 
 <h2>Welcome, %s!</h2>
 
-<p>Your unique account number is:</p>
+<p>Your account number:</p>
 
 <div class="account-number">
 %s
 </div>
 
 <p>
-Starting Balance:
-<strong>$1,000.00</strong>
+Starting balance:
+<strong>%.2f %s</strong>
 </p>
 
 <p>
-Give your account number to other customers so they can send you money.
+This is approximately equal to $1,000 USD.
 </p>
 
 <a href="/">
@@ -587,34 +897,47 @@ Give your account number to other customers so they can send you money.
 </a>
 
 </div>
+
 </div>
 
 </body>
 </html>
+
 `,
 		template.HTMLEscapeString(name),
-		template.HTMLEscapeString(accountNumber),
+		accountNumber,
+		startingBalance,
+		currency,
 	)
 }
 
-// ---------- LOGIN ----------
+// ----------------------------------------------------
+// LOGIN
+// ----------------------------------------------------
 
 func login(w http.ResponseWriter, r *http.Request) {
-	username := strings.TrimSpace(r.FormValue("username"))
+
+	username := strings.TrimSpace(
+		r.FormValue("username"),
+	)
+
 	password := r.FormValue("password")
 
 	mu.Lock()
 
 	account := findAccount(username)
 
-	if account == nil || account.PasswordHash != hashPassword(password) {
+	if account == nil ||
+		account.PasswordHash != hashPassword(password) {
+
 		mu.Unlock()
 
 		loginPage(w, `
 <div class="error">
-Incorrect username or password.
+Invalid username or password.
 </div>
 `)
+
 		return
 	}
 
@@ -626,52 +949,82 @@ Incorrect username or password.
 		Name:     "session",
 		Value:    sessionID,
 		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
 		Path:     "/",
 	})
 
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(
+		w,
+		r,
+		"/",
+		http.StatusSeeOther,
+	)
 }
 
-// ---------- SEND PAGE ----------
+// ----------------------------------------------------
+// SEND PAGE
+// ----------------------------------------------------
 
 func sendPage(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
+
 		loginPage(w, `
 <div class="error">
-Please sign in first.
+Please sign in before sending money.
 </div>
 `)
+
 		return
 	}
 
 	fmt.Fprintln(w, pageStart("Send Money"))
 
 	fmt.Fprintln(w, `
+
 <div class="container">
 
 <div class="card">
 
 <h1>📤 Send Money</h1>
 
-<p>Enter an account number to find the recipient.</p>
-
-<form action="/send-money" method="POST">
-
 <label>Recipient Account Number</label>
 
 <input
 id="accountNumber"
 type="text"
-name="account"
 placeholder="Start typing account number..."
 maxlength="10"
 autocomplete="off"
-required
 >
 
 <div id="recipient"></div>
+
+<form action="/send-money" method="POST">
+
+<input
+id="selectedAccount"
+type="hidden"
+name="account"
+>
+
+<label>Currency to Send</label>
+
+<select name="sendCurrency">
+
+<option value="USD">USD - US Dollar</option>
+<option value="EUR">EUR - Euro</option>
+<option value="GBP">GBP - British Pound</option>
+<option value="JPY">JPY - Japanese Yen</option>
+<option value="NGN">NGN - Nigerian Naira</option>
+<option value="CAD">CAD - Canadian Dollar</option>
+<option value="AUD">AUD - Australian Dollar</option>
+<option value="CHF">CHF - Swiss Franc</option>
+
+</select>
 
 <label>Amount</label>
 
@@ -680,7 +1033,6 @@ type="number"
 name="amount"
 step="0.01"
 min="0.01"
-placeholder="Enter amount"
 required
 >
 
@@ -691,70 +1043,94 @@ Send Money
 </form>
 
 </div>
+
 </div>
 
 <script>
 
-const input = document.getElementById("accountNumber");
-const recipient = document.getElementById("recipient");
+const input =
+document.getElementById("accountNumber");
+
+const recipient =
+document.getElementById("recipient");
+
+const selected =
+document.getElementById("selectedAccount");
 
 input.addEventListener("input", async function() {
 
 	const number = this.value;
+
+	selected.value = "";
 
 	if (number.length === 0) {
 		recipient.innerHTML = "";
 		return;
 	}
 
-	const response = await fetch(
-		"/search?account=" + encodeURIComponent(number)
-	);
+	try {
 
-	const data = await response.json();
+		const response = await fetch(
+			"/search?account=" +
+			encodeURIComponent(number)
+		);
 
-	if (data.length === 0) {
+		const data = await response.json();
+
+		if (data.length === 0) {
+
+			recipient.innerHTML =
+			"<div class='error'>" +
+			"No matching account found." +
+			"</div>";
+
+			return;
+		}
+
+		let html =
+		"<div class='recipient'>" +
+		"<strong>Accounts found:</strong>";
+
+		data.forEach(function(account) {
+
+			html +=
+			"<div class='suggestion' " +
+			"onclick=\"selectAccount('" +
+			account.accountNo +
+			"')\">" +
+
+			"👤 <strong>" +
+			account.name +
+			"</strong><br>" +
+
+			"Account: " +
+			account.accountNo +
+			"<br>" +
+
+			"Currency: " +
+			account.currency +
+
+			"</div>";
+
+		});
+
+		html += "</div>";
+
+		recipient.innerHTML = html;
+
+	} catch (error) {
 
 		recipient.innerHTML =
-		"<div class='error'>No matching account found.</div>";
-
-		return;
-	}
-
-	let html =
-	"<div class='recipient'>" +
-	"<strong>Matching Accounts</strong>";
-
-	data.forEach(function(account) {
-
-		html +=
-		"<div class='suggestion' " +
-		"onclick=\"selectAccount('" +
-		account.accountNo +
-		"')\">" +
-
-		"👤 <strong>" +
-		account.name +
-		"</strong>" +
-
-		"<br>" +
-
-		"<small>Account: " +
-		account.accountNo +
-		"</small>" +
-
+		"<div class='error'>" +
+		"Unable to search accounts." +
 		"</div>";
-
-	});
-
-	html += "</div>";
-
-	recipient.innerHTML = html;
+	}
 });
 
 function selectAccount(number) {
 
 	input.value = number;
+	selected.value = number;
 
 	recipient.innerHTML =
 	"<div class='success'>" +
@@ -767,16 +1143,24 @@ function selectAccount(number) {
 
 </body>
 </html>
+
 `)
 }
 
-// ---------- SEARCH ----------
+// ----------------------------------------------------
+// SEARCH ACCOUNTS
+// ----------------------------------------------------
 
 func searchAccounts(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
-		http.Error(w, "Not logged in", http.StatusUnauthorized)
+		http.Error(
+			w,
+			"Not logged in",
+			http.StatusUnauthorized,
+		)
 		return
 	}
 
@@ -792,41 +1176,62 @@ func searchAccounts(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if strings.HasPrefix(account.AccountNo, number) {
+		if strings.HasPrefix(
+			account.AccountNo,
+			number,
+		) {
 
-			results = append(results, SearchResult{
-				Name:      account.Name,
-				AccountNo: account.AccountNo,
-			})
+			results = append(
+				results,
+				SearchResult{
+					Name:      account.Name,
+					AccountNo: account.AccountNo,
+					Currency:  account.Currency,
+				},
+			)
+		}
 
-			if len(results) >= 10 {
-				break
-			}
+		if len(results) >= 10 {
+			break
 		}
 	}
 
 	mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
 
 	json.NewEncoder(w).Encode(results)
 }
 
-// ---------- SEND MONEY ----------
+// ----------------------------------------------------
+// SEND MONEY
+// ----------------------------------------------------
 
 func sendMoney(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
+
 		loginPage(w, `
 <div class="error">
 Please sign in first.
 </div>
 `)
+
 		return
 	}
 
-	accountNumber := strings.TrimSpace(r.FormValue("account"))
+	accountNumber := strings.TrimSpace(
+		r.FormValue("account"),
+	)
+
+	sendCurrency := strings.ToUpper(
+		r.FormValue("sendCurrency"),
+	)
 
 	amount, err := strconv.ParseFloat(
 		r.FormValue("amount"),
@@ -834,59 +1239,166 @@ Please sign in first.
 	)
 
 	if err != nil || amount <= 0 {
-		fmt.Fprintln(w, "Please enter a valid amount.")
+		fmt.Fprintln(w, "Invalid amount.")
 		return
 	}
 
 	mu.Lock()
-	defer mu.Unlock()
 
 	sender := findAccount(username)
 	receiver := findAccountByNumber(accountNumber)
 
 	if sender == nil || receiver == nil {
-		fmt.Fprintln(w, "Receiver account not found.")
+		mu.Unlock()
+
+		fmt.Fprintln(w, "Recipient not found.")
 		return
 	}
 
 	if sender.AccountNo == receiver.AccountNo {
-		fmt.Fprintln(w, "You cannot send money to yourself.")
+		mu.Unlock()
+
+		fmt.Fprintln(
+			w,
+			"You cannot send money to yourself.",
+		)
+
 		return
 	}
 
-	if sender.Balance < amount {
-		fmt.Fprintln(w, "Insufficient balance.")
+	senderCurrency := sender.Currency
+	receiverCurrency := receiver.Currency
+
+	mu.Unlock()
+
+	senderToSendRate, err := getExchangeRate(
+		senderCurrency,
+		sendCurrency,
+	)
+
+	if err != nil {
+
+		fmt.Fprintln(
+			w,
+			"Unable to get exchange rate.",
+		)
+
 		return
 	}
 
-	sender.Balance -= amount
-	receiver.Balance += amount
-
-	now := time.Now().Format("02 Jan 2006, 15:04")
-
-	transactions[username] = append(
-		transactions[username],
-		Transaction{
-			Type:    "Sent",
-			Amount:  amount,
-			Details: "Sent to " + receiver.Name,
-			Date:    now,
-		},
+	sendToReceiverRate, err := getExchangeRate(
+		sendCurrency,
+		receiverCurrency,
 	)
 
-	transactions[receiver.Username] = append(
-		transactions[receiver.Username],
-		Transaction{
-			Type:    "Received",
-			Amount:  amount,
-			Details: "Received from " + sender.Name,
-			Date:    now,
-		},
+	if err != nil {
+
+		fmt.Fprintln(
+			w,
+			"Unable to get exchange rate.",
+		)
+
+		return
+	}
+
+	amountFromSender :=
+		amount / senderToSendRate
+
+	amountForReceiver :=
+		amount * sendToReceiverRate
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	sender = findAccount(username)
+	receiver = findAccountByNumber(accountNumber)
+
+	if sender == nil || receiver == nil {
+		fmt.Fprintln(w, "Account not found.")
+		return
+	}
+
+	if sender.Balance < amountFromSender {
+
+		fmt.Fprintln(w, pageStart("Transfer Failed"))
+
+		fmt.Fprintln(w, `
+
+<div class="container">
+
+<div class="card">
+
+<div class="error">
+
+<h2>Transfer Failed ❌</h2>
+
+<p>Insufficient balance.</p>
+
+</div>
+
+<a href="/send">
+<button>Try Again</button>
+</a>
+
+</div>
+
+</div>
+
+</body>
+</html>
+
+`)
+
+		return
+	}
+
+	sender.Balance -= amountFromSender
+	receiver.Balance += amountForReceiver
+
+	now := time.Now().Format(
+		"02 Jan 2006, 15:04",
 	)
+
+	transactions[username] =
+		append(
+			transactions[username],
+			Transaction{
+				Type:     "Sent",
+				Amount:   amount,
+				Currency: sendCurrency,
+				Details: fmt.Sprintf(
+					"Sent to %s. Sender charged %.2f %s. Receiver received %.2f %s.",
+					receiver.Name,
+					amountFromSender,
+					senderCurrency,
+					amountForReceiver,
+					receiverCurrency,
+				),
+				Date: now,
+			},
+		)
+
+	transactions[receiver.Username] =
+		append(
+			transactions[receiver.Username],
+			Transaction{
+				Type:     "Received",
+				Amount:   amountForReceiver,
+				Currency: receiverCurrency,
+				Details: fmt.Sprintf(
+					"Received from %s. Original transfer: %.2f %s.",
+					sender.Name,
+					amount,
+					sendCurrency,
+				),
+				Date: now,
+			},
+		)
 
 	fmt.Fprintln(w, pageStart("Transfer Successful"))
 
 	fmt.Fprintf(w, `
+
 <div class="container">
 
 <div class="card">
@@ -896,8 +1408,31 @@ Please sign in first.
 <h1>Transfer Successful! ✅</h1>
 
 <p>
-You sent <strong>$%.2f</strong>
-to <strong>%s</strong>.
+You sent:
+<strong>
+%.2f %s
+</strong>
+</p>
+
+<p>
+Your account was charged:
+<strong>
+%.2f %s
+</strong>
+</p>
+
+<p>
+Recipient received:
+<strong>
+%.2f %s
+</strong>
+</p>
+
+<p>
+Recipient:
+<strong>
+%s
+</strong>
 </p>
 
 </div>
@@ -911,33 +1446,46 @@ to <strong>%s</strong>.
 </a>
 
 </div>
+
 </div>
 
 </body>
 </html>
+
 `,
 		amount,
+		sendCurrency,
+		amountFromSender,
+		senderCurrency,
+		amountForReceiver,
+		receiverCurrency,
 		template.HTMLEscapeString(receiver.Name),
 	)
 }
 
-// ---------- WITHDRAW PAGE ----------
+// ----------------------------------------------------
+// WITHDRAW PAGE
+// ----------------------------------------------------
 
 func withdrawPage(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
+
 		loginPage(w, `
 <div class="error">
 Please sign in first.
 </div>
 `)
+
 		return
 	}
 
 	fmt.Fprintln(w, pageStart("Withdraw"))
 
 	fmt.Fprintln(w, `
+
 <div class="container">
 
 <div class="card">
@@ -953,35 +1501,41 @@ type="number"
 name="amount"
 step="0.01"
 min="0.01"
-placeholder="Enter amount"
 required
 >
 
 <button type="submit">
-Withdraw Money
+Withdraw
 </button>
 
 </form>
 
 </div>
+
 </div>
 
 </body>
 </html>
+
 `)
 }
 
-// ---------- WITHDRAW ----------
+// ----------------------------------------------------
+// WITHDRAW
+// ----------------------------------------------------
 
 func withdraw(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
+
 		loginPage(w, `
 <div class="error">
 Please sign in first.
 </div>
 `)
+
 		return
 	}
 
@@ -991,7 +1545,12 @@ Please sign in first.
 	)
 
 	if err != nil || amount <= 0 {
-		fmt.Fprintln(w, "Please enter a valid amount.")
+
+		fmt.Fprintln(
+			w,
+			"Invalid amount.",
+		)
+
 		return
 	}
 
@@ -1001,36 +1560,71 @@ Please sign in first.
 	account := findAccount(username)
 
 	if account == nil {
-		fmt.Fprintln(w, "Account not found.")
+
+		fmt.Fprintln(
+			w,
+			"Account not found.",
+		)
+
 		return
 	}
 
 	if account.Balance < amount {
+
+		fmt.Fprintln(w, pageStart("Withdrawal Failed"))
+
 		fmt.Fprintln(w, `
-<h1>Withdrawal Failed</h1>
+
+<div class="container">
+
+<div class="card">
+
+<div class="error">
+
+<h2>Withdrawal Failed ❌</h2>
+
 <p>Insufficient balance.</p>
-<a href="/withdraw">Try Again</a>
+
+</div>
+
+<a href="/withdraw">
+<button>Try Again</button>
+</a>
+
+</div>
+
+</div>
+
+</body>
+</html>
+
 `)
+
 		return
 	}
 
 	account.Balance -= amount
 
-	now := time.Now().Format("02 Jan 2006, 15:04")
-
-	transactions[username] = append(
-		transactions[username],
-		Transaction{
-			Type:    "Withdrawal",
-			Amount:  amount,
-			Details: "Cash withdrawal",
-			Date:    now,
-		},
+	now := time.Now().Format(
+		"02 Jan 2006, 15:04",
 	)
+
+	transactions[username] =
+		append(
+			transactions[username],
+			Transaction{
+				Type:     "Withdrawal",
+				Amount:   amount,
+				Currency: account.Currency,
+				Details:  "Cash withdrawal",
+				Date:     now,
+			},
+		)
 
 	fmt.Fprintln(w, pageStart("Withdrawal Successful"))
 
 	fmt.Fprintf(w, `
+
 <div class="container">
 
 <div class="card">
@@ -1040,7 +1634,10 @@ Please sign in first.
 <h1>Withdrawal Successful! ✅</h1>
 
 <p>
-You withdrew <strong>$%.2f</strong>.
+You withdrew:
+<strong>
+%.2f %s
+</strong>
 </p>
 
 </div>
@@ -1050,58 +1647,63 @@ You withdrew <strong>$%.2f</strong>.
 </a>
 
 </div>
+
 </div>
 
 </body>
 </html>
-`, amount)
+
+`,
+		amount,
+		account.Currency,
+	)
 }
 
-// ---------- TRANSACTIONS ----------
+// ----------------------------------------------------
+// TRANSACTIONS
+// ----------------------------------------------------
 
 func transactionPage(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
+
 		loginPage(w, `
 <div class="error">
 Please sign in first.
 </div>
 `)
+
 		return
 	}
 
 	mu.Lock()
 
-	userTransactions := append(
-		[]Transaction(nil),
-		transactions[username]...,
-	)
+	userTransactions :=
+		append(
+			[]Transaction(nil),
+			transactions[username]...,
+		)
 
 	mu.Unlock()
 
 	fmt.Fprintln(w, pageStart("Transactions"))
 
 	fmt.Fprintln(w, `
+
 <div class="container">
 
 <div class="card">
 
-<h1>📜 Transaction History</h1>
+<h1>📜 Transactions</h1>
+
 `)
 
 	if len(userTransactions) == 0 {
 
 		fmt.Fprintln(w, `
-<div class="recipient">
-
-<h3>No transactions yet.</h3>
-
-<p>
-Send money or withdraw money to see your activity here.
-</p>
-
-</div>
+<p>No transactions yet.</p>
 `)
 
 	} else {
@@ -1124,18 +1726,17 @@ Send money or withdraw money to see your activity here.
 			}
 
 			fmt.Fprintf(w, `
+
 <div class="transaction %s">
 
 <h3>
 %s %s
 </h3>
 
-<p>
-%s
-</p>
+<p>%s</p>
 
 <strong>
-$%.2f
+%.2f %s
 </strong>
 
 <p>
@@ -1143,19 +1744,23 @@ $%.2f
 </p>
 
 </div>
+
 `,
 				class,
 				icon,
-				template.HTMLEscapeString(t.Type),
+				t.Type,
 				template.HTMLEscapeString(t.Details),
 				t.Amount,
-				template.HTMLEscapeString(t.Date),
+				t.Currency,
+				t.Date,
 			)
 		}
 	}
 
 	fmt.Fprintln(w, `
+
 </div>
+
 </div>
 
 </body>
@@ -1163,17 +1768,22 @@ $%.2f
 `)
 }
 
-// ---------- PROFILE ----------
+// ----------------------------------------------------
+// PROFILE
+// ----------------------------------------------------
 
 func profilePage(w http.ResponseWriter, r *http.Request) {
+
 	username := getLoggedInUser(r)
 
 	if username == "" {
+
 		loginPage(w, `
 <div class="error">
 Please sign in first.
 </div>
 `)
+
 		return
 	}
 
@@ -1182,14 +1792,21 @@ Please sign in first.
 	account := findAccount(username)
 
 	if account == nil {
+
 		mu.Unlock()
-		fmt.Fprintln(w, "Account not found.")
+
+		fmt.Fprintln(
+			w,
+			"Account not found.",
+		)
+
 		return
 	}
 
 	name := account.Name
 	user := account.Username
 	number := account.AccountNo
+	currency := account.Currency
 	balance := account.Balance
 
 	mu.Unlock()
@@ -1197,6 +1814,7 @@ Please sign in first.
 	fmt.Fprintln(w, pageStart("Profile"))
 
 	fmt.Fprintf(w, `
+
 <div class="container">
 
 <div class="card">
@@ -1204,13 +1822,11 @@ Please sign in first.
 <h1>👤 My Profile</h1>
 
 <p>
-<strong>Name:</strong>
-%s
+<strong>Name:</strong> %s
 </p>
 
 <p>
-<strong>Username:</strong>
-%s
+<strong>Username:</strong> %s
 </p>
 
 <p>
@@ -1222,33 +1838,58 @@ Please sign in first.
 </div>
 
 <p>
+<strong>Currency:</strong> %s
+</p>
+
+<p>
 <strong>Balance:</strong>
-$%.2f
+%.2f %s
+</p>
+
+<hr>
+
+<p>
+<strong>Password:</strong>
+••••••••
+</p>
+
+<p>
+Your password is securely stored and cannot be displayed.
 </p>
 
 </div>
+
 </div>
 
 </body>
 </html>
+
 `,
 		template.HTMLEscapeString(name),
 		template.HTMLEscapeString(user),
 		template.HTMLEscapeString(number),
+		template.HTMLEscapeString(currency),
 		balance,
+		template.HTMLEscapeString(currency),
 	)
 }
 
-// ---------- LOGOUT ----------
+// ----------------------------------------------------
+// LOGOUT
+// ----------------------------------------------------
 
 func logout(w http.ResponseWriter, r *http.Request) {
+
 	cookie, err := r.Cookie("session")
 
 	if err == nil {
 
 		mu.Lock()
 
-		delete(sessions, cookie.Value)
+		delete(
+			sessions,
+			cookie.Value,
+		)
 
 		mu.Unlock()
 
@@ -1257,44 +1898,141 @@ func logout(w http.ResponseWriter, r *http.Request) {
 			Value:    "",
 			MaxAge:   -1,
 			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
 			Path:     "/",
 		})
 	}
 
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(
+		w,
+		r,
+		"/",
+		http.StatusSeeOther,
+	)
 }
 
-// ---------- 1000 TEST ACCOUNTS ----------
+// ----------------------------------------------------
+// TEST ACCOUNT NAMES
+// ----------------------------------------------------
 
-func createTestAccounts() {
+var firstNames = []string{
+	"James", "John", "Robert", "Michael", "William",
+	"David", "Richard", "Joseph", "Thomas", "Charles",
+	"Christopher", "Daniel", "Matthew", "Anthony", "Mark",
+	"Donald", "Steven", "Paul", "Andrew", "Joshua",
+	"Kenneth", "Kevin", "Brian", "George", "Edward",
+	"Ronald", "Timothy", "Jason", "Jeffrey", "Ryan",
+	"Jacob", "Gary", "Nicholas", "Eric", "Jonathan",
+	"Stephen", "Larry", "Justin", "Scott", "Brandon",
+	"Benjamin", "Samuel", "Gregory", "Alexander", "Patrick",
+	"Frank", "Raymond", "Jack", "Dennis", "Jerry",
+}
 
-	for i := 1; i <= 1000; i++ {
+var lastNames = []string{
+	"Smith", "Johnson", "Williams", "Brown", "Jones",
+	"Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+	"Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson",
+	"Thomas", "Taylor", "Moore", "Jackson", "Martin",
+	"Lee", "Perez", "Thompson", "White", "Harris",
+	"Sanchez", "Clark", "Ramirez", "Lewis", "Robinson",
+	"Walker", "Young", "Allen", "King", "Wright",
+	"Scott", "Torres", "Nguyen", "Hill", "Flores",
+	"Green", "Adams", "Nelson", "Baker", "Hall",
+	"Rivera", "Campbell", "Mitchell", "Carter", "Roberts",
+}
 
-		username := fmt.Sprintf(
-			"testuser%04d",
-			i,
+// ----------------------------------------------------
+// TEST ACCOUNTS
+// ----------------------------------------------------
+
+func createTestAccounts() error {
+
+	rates := make(map[string]float64)
+
+	fmt.Println("Getting exchange rates...")
+
+	for _, currency := range currencies {
+
+		rate, err := getExchangeRate(
+			"USD",
+			currency,
 		)
 
-		name := fmt.Sprintf(
-			"Test User %04d",
-			i,
-		)
-
-		accountNumber := generateAccountNumber()
-
-		account := Account{
-			Name:         name,
-			Username:     username,
-			PasswordHash: hashPassword("1234"),
-			AccountNo:    accountNumber,
-			Balance:      1000,
+		if err != nil {
+			return fmt.Errorf(
+				"could not get USD to %s rate: %v",
+				currency,
+				err,
+			)
 		}
 
-		accounts = append(accounts, account)
+		rates[currency] = rate
 	}
+
+	fmt.Println("Creating test accounts...")
+
+	for i := 0; i < 1000; i++ {
+
+		first :=
+			firstNames[i%len(firstNames)]
+
+		last :=
+			lastNames[
+				(i/len(firstNames))%
+					len(lastNames),
+			]
+
+		name :=
+			fmt.Sprintf(
+				"%s %s",
+				first,
+				last,
+			)
+
+		username :=
+			fmt.Sprintf(
+				"customer%04d",
+				i+1,
+			)
+
+		password :=
+			fmt.Sprintf(
+				"BankUser%04d!",
+				i+1,
+			)
+
+		currency :=
+			currencies[
+				i%len(currencies),
+			]
+
+		accountNumber :=
+			generateAccountNumber()
+
+		balance :=
+			1000 * rates[currency]
+
+		accounts =
+			append(
+				accounts,
+				Account{
+					Name:         name,
+					Username:     username,
+					PasswordHash: hashPassword(password),
+					AccountNo:    accountNumber,
+					Currency:     currency,
+					Balance:      balance,
+				},
+			)
+	}
+
+	return nil
 }
 
-// ---------- MAIN ----------
+// ----------------------------------------------------
+// MAIN
+// ----------------------------------------------------
 
 func main() {
 
@@ -1302,34 +2040,57 @@ func main() {
 	transactions = make(map[string][]Transaction)
 	sessions = make(map[string]string)
 
-	createTestAccounts()
-
 	fmt.Println("==============================================")
 	fmt.Println("       CALEB'S CITY MALL BANK")
 	fmt.Println("==============================================")
-	fmt.Println("1000 test accounts created.")
+
+	err := createTestAccounts()
+
+	if err != nil {
+		fmt.Println("")
+		fmt.Println("ERROR:")
+		fmt.Println(err)
+		fmt.Println("")
+		fmt.Println("Check your internet connection.")
+		return
+	}
+
 	fmt.Println("")
-	fmt.Println("Example test account:")
-	fmt.Println("Username: testuser0001")
-	fmt.Println("Password: 1234")
+	fmt.Println("1,000 test accounts created.")
 	fmt.Println("")
-	fmt.Println("Server:")
-	fmt.Println("http://localhost:8080")
-	fmt.Println("==============================================")
+	fmt.Println("TEST LOGIN")
+	fmt.Println("------------------------------")
+	fmt.Println("Username: customer0001")
+	fmt.Println("Password: BankUser0001!")
+	fmt.Println("------------------------------")
 
 	http.HandleFunc("/", home)
+
 	http.HandleFunc("/register", registerPage)
 	http.HandleFunc("/login", login)
+
 	http.HandleFunc("/send", sendPage)
 	http.HandleFunc("/send-money", sendMoney)
 	http.HandleFunc("/search", searchAccounts)
+
 	http.HandleFunc("/withdraw", withdrawPage)
 	http.HandleFunc("/withdraw-money", withdraw)
+
 	http.HandleFunc("/transactions", transactionPage)
 	http.HandleFunc("/profile", profilePage)
 	http.HandleFunc("/logout", logout)
 
-	err := http.ListenAndServe(":8080", nil)
+	port := os.Getenv("PORT")
+
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Println("")
+	fmt.Println("Server running on port:", port)
+	fmt.Println("")
+
+	err = http.ListenAndServe(":"+port, nil)
 
 	if err != nil {
 		fmt.Println("Server error:", err)
