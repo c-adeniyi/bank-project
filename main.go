@@ -695,6 +695,10 @@ Sign In
 </form>
 
 <p>
+<a href="/forgot-password">Forgot your password?</a>
+</p>
+
+<p>
 Don't have an account?
 <a href="/register">Create an account</a>
 </p>
@@ -1004,6 +1008,383 @@ This is approximately equal to $1,000 USD.
 		startingBalance,
 		currency,
 	)
+}
+
+// ----------------------------------------------------
+// FORGOT PASSWORD / PASSWORD RESET
+// ----------------------------------------------------
+//
+// Demo recovery flow:
+// 1. User enters username + account number.
+// 2. If both match, the user can choose a new password.
+// 3. All existing sessions for that username are invalidated.
+//
+// For a real banking system, recovery should use a verified
+// email/phone plus a one-time, expiring reset token.
+// ----------------------------------------------------
+
+func forgotPasswordPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		fmt.Fprintln(w, pageStart("Forgot Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+
+<div class="card">
+
+<h1>🔐 Forgot Password</h1>
+
+<p>Enter your username and account number to verify your account.</p>
+
+<form action="/forgot-password" method="POST">
+
+<label>Username</label>
+
+<input
+type="text"
+name="username"
+required
+autocomplete="username"
+>
+
+<label>Account Number</label>
+
+<input
+type="text"
+name="account"
+required
+maxlength="10"
+inputmode="numeric"
+>
+
+<button type="submit">
+Continue
+</button>
+
+</form>
+
+<p>
+<a href="/">Back to login</a>
+</p>
+
+</div>
+
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	username := strings.TrimSpace(r.FormValue("username"))
+	accountNumber := strings.TrimSpace(r.FormValue("account"))
+
+	if username == "" || accountNumber == "" {
+		fmt.Fprintln(w, pageStart("Forgot Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+<div class="card">
+
+<div class="error">
+Please enter both your username and account number.
+</div>
+
+<a href="/forgot-password">
+<button>Try Again</button>
+</a>
+
+</div>
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	mu.Lock()
+	account := findAccount(username)
+
+	matches := account != nil && account.AccountNo == accountNumber
+
+	mu.Unlock()
+
+	if !matches {
+		fmt.Fprintln(w, pageStart("Forgot Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+<div class="card">
+
+<div class="error">
+The username and account number could not be verified.
+</div>
+
+<a href="/forgot-password">
+<button>Try Again</button>
+</a>
+
+</div>
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	// The account was verified. Show the password-reset form.
+	fmt.Fprintln(w, pageStart("Reset Password"))
+
+	fmt.Fprintln(w, `
+<div class="container">
+
+<div class="card">
+
+<h1>🔑 Reset Password</h1>
+
+<div class="success">
+Account verified. Choose a new password.
+</div>
+
+<form action="/reset-password" method="POST">
+
+<input
+type="hidden"
+name="username"
+value="` + template.HTMLEscapeString(username) + `"
+>
+
+<input
+type="hidden"
+name="account"
+value="` + template.HTMLEscapeString(accountNumber) + `"
+>
+
+<label>New Password</label>
+
+<input
+type="password"
+name="password"
+required
+autocomplete="new-password"
+>
+
+<label>Confirm New Password</label>
+
+<input
+type="password"
+name="confirmPassword"
+required
+autocomplete="new-password"
+>
+
+<div class="info">
+
+<strong>Password requirements:</strong>
+
+<ul>
+<li>At least 8 characters</li>
+<li>1 uppercase letter</li>
+<li>1 lowercase letter</li>
+<li>1 number</li>
+<li>1 symbol</li>
+</ul>
+
+</div>
+
+<button type="submit">
+Reset Password
+</button>
+
+</form>
+
+</div>
+
+</div>
+
+</body>
+</html>
+`)
+}
+
+func resetPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(
+			w,
+			"Method not allowed",
+			http.StatusMethodNotAllowed,
+		)
+		return
+	}
+
+	username := strings.TrimSpace(r.FormValue("username"))
+	accountNumber := strings.TrimSpace(r.FormValue("account"))
+	password := r.FormValue("password")
+	confirmPassword := r.FormValue("confirmPassword")
+
+	if username == "" || accountNumber == "" {
+		fmt.Fprintln(w, pageStart("Reset Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+<div class="card">
+
+<div class="error">
+Invalid password reset request.
+</div>
+
+<a href="/forgot-password">
+<button>Start Again</button>
+</a>
+
+</div>
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	if password != confirmPassword {
+		fmt.Fprintln(w, pageStart("Reset Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+<div class="card">
+
+<div class="error">
+The passwords do not match.
+</div>
+
+<a href="/forgot-password">
+<button>Try Again</button>
+</a>
+
+</div>
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	if !validPassword(password) {
+		fmt.Fprintln(w, pageStart("Reset Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+<div class="card">
+
+<div class="error">
+
+<strong>Password does not meet the requirements.</strong>
+
+<ul>
+<li>At least 8 characters</li>
+<li>1 uppercase letter</li>
+<li>1 lowercase letter</li>
+<li>1 number</li>
+<li>1 symbol</li>
+</ul>
+
+</div>
+
+<a href="/forgot-password">
+<button>Try Again</button>
+</a>
+
+</div>
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	mu.Lock()
+
+	account := findAccount(username)
+
+	if account == nil || account.AccountNo != accountNumber {
+		mu.Unlock()
+
+		fmt.Fprintln(w, pageStart("Reset Password"))
+
+		fmt.Fprintln(w, `
+<div class="container">
+<div class="card">
+
+<div class="error">
+The account could not be verified. Please start again.
+</div>
+
+<a href="/forgot-password">
+<button>Start Again</button>
+</a>
+
+</div>
+</div>
+
+</body>
+</html>
+`)
+
+		return
+	}
+
+	account.PasswordHash = hashPassword(password)
+
+	// Invalidate all existing login sessions for this account.
+	for sessionID, sessionUsername := range sessions {
+		if sessionUsername == username {
+			delete(sessions, sessionID)
+		}
+	}
+
+	persistLocked()
+
+	mu.Unlock()
+
+	fmt.Fprintln(w, pageStart("Password Reset"))
+
+	fmt.Fprintln(w, `
+<div class="container">
+
+<div class="card">
+
+<div class="success">
+
+<h1>Password Reset Successful! ✅</h1>
+
+<p>Your password has been changed successfully.</p>
+
+<p>For your security, any previous login sessions have been signed out.</p>
+
+</div>
+
+<a href="/">
+<button>Go to Login</button>
+</a>
+
+</div>
+
+</div>
+
+</body>
+</html>
+`)
 }
 
 // ----------------------------------------------------
@@ -2188,6 +2569,8 @@ func main() {
 
 	http.HandleFunc("/register", registerPage)
 	http.HandleFunc("/login", login)
+	http.HandleFunc("/forgot-password", forgotPasswordPage)
+	http.HandleFunc("/reset-password", resetPassword)
 
 	http.HandleFunc("/send", sendPage)
 	http.HandleFunc("/send-money", sendMoney)
