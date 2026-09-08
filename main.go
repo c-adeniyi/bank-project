@@ -1079,7 +1079,7 @@ function toggleField(id, button) {
 	)
 
 	if err := sendEmail(email, "Verify your Caleb's City Mall Bank account", emailBody); err != nil {
-		// Remove the just-created account if email delivery is not configured.
+		// Remove the just-created account since verification email delivery failed.
 		mu.Lock()
 		for i := range accounts {
 			if accounts[i].Username == username {
@@ -1091,7 +1091,12 @@ function toggleField(id, button) {
 		persistLocked()
 		mu.Unlock()
 
-		renderError(w, "Email Setup Required", "Your account could not be created because the email service is not configured. Add RESEND_API_KEY and EMAIL_FROM in Render and try again.", "/register")
+		// Show the real reason sendEmail failed instead of a hardcoded
+		// "not configured" message, since that message was misleading
+		// whenever RESEND_API_KEY/EMAIL_FROM were already set correctly
+		// but the request to Resend failed for some other reason
+		// (bad/expired key, unverified sender domain, rate limit, etc.).
+		renderError(w, "Email Delivery Failed", "Your account could not be created because the verification email failed to send: "+err.Error(), "/register")
 		return
 	}
 
@@ -1242,7 +1247,7 @@ func forgotPasswordPage(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		delete(resetTokens, token)
 		mu.Unlock()
-		renderError(w, "Email Error", "We could not send the reset email. Check the email service configuration and try again.", "/forgot-password")
+		renderError(w, "Email Error", "We could not send the reset email: "+err.Error(), "/forgot-password")
 		return
 	}
 
@@ -1445,7 +1450,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		delete(loginChallenges, challengeID)
 		mu.Unlock()
-		loginPage(w, `<div class="error">We could not send your verification code. Email delivery is not configured correctly.</div>`)
+		loginPage(w, `<div class="error">We could not send your verification code: `+template.HTMLEscapeString(err.Error())+`</div>`)
 		return
 	}
 	fmt.Fprintln(w, pageStart("Two-Step Verification"))
