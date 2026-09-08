@@ -61,6 +61,99 @@ var currencies = []string{
 }
 
 // ----------------------------------------------------
+// PERSISTENCE
+//
+// The old version of this app kept everything in plain
+// Go variables (accounts, transactions). That data only
+// ever existed in the memory of ONE running process, so:
+//   - if the host restarted/redeployed the process, every
+//     account/transaction vanished and a brand new batch
+//     of 1,000 test accounts was generated
+//   - if you ever ran more than one instance of the
+//     server (e.g. behind a load balancer), each instance
+//     had its own separate copy of "accounts", so an
+//     account created on instance A was invisible to
+//     instance B
+//
+// This adds a simple JSON-file store so accounts and
+// transactions survive restarts. Every mutation is saved
+// to disk immediately, and the whole state is reloaded
+// on startup instead of always generating fresh test data.
+//
+// NOTE: this still assumes a single running instance with
+// a persistent disk. If you deploy multiple instances
+// behind a load balancer, you'll need a real shared
+// database (SQLite on a shared volume, or Postgres/MySQL)
+// instead of a local JSON file — happy to do that next if
+// that's how you're hosting this.
+// ----------------------------------------------------
+
+const dataFile = "data.json"
+
+type PersistedState struct {
+	Accounts     []Account                `json:"accounts"`
+	Transactions map[string][]Transaction `json:"transactions"`
+}
+
+// persistLocked writes the current state to disk.
+// Caller MUST already hold mu before calling this.
+func persistLocked() {
+	state := PersistedState{
+		Accounts:     accounts,
+		Transactions: transactions,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+
+	if err != nil {
+		fmt.Println("WARNING: failed to encode state:", err)
+		return
+	}
+
+	tmpFile := dataFile + ".tmp"
+
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+		fmt.Println("WARNING: failed to write state file:", err)
+		return
+	}
+
+	// Write-then-rename so a crash mid-write can never
+	// leave data.json half-written/corrupted.
+	if err := os.Rename(tmpFile, dataFile); err != nil {
+		fmt.Println("WARNING: failed to save state file:", err)
+	}
+}
+
+// loadState loads accounts/transactions from disk if a
+// data file already exists. Returns true if it loaded
+// existing data, false if there was nothing to load.
+func loadState() bool {
+	data, err := os.ReadFile(dataFile)
+
+	if err != nil {
+		// No file yet (first run) — nothing to load.
+		return false
+	}
+
+	var state PersistedState
+
+	if err := json.Unmarshal(data, &state); err != nil {
+		fmt.Println("WARNING: could not parse data.json, ignoring it:", err)
+		return false
+	}
+
+	accounts = state.Accounts
+
+	if state.Transactions != nil {
+		transactions = state.Transactions
+	} else {
+		transactions = make(map[string][]Transaction)
+	}
+
+	return true
+}
+
+// ----------------------------------------------------
 // PASSWORD
 // ----------------------------------------------------
 
@@ -859,6 +952,8 @@ Please try again later.
 		Balance:      startingBalance,
 	})
 
+	persistLocked()
+
 	mu.Unlock()
 
 	fmt.Fprintln(w, pageStart("Account Created"))
@@ -1395,6 +1490,8 @@ Please sign in first.
 			},
 		)
 
+	persistLocked()
+
 	fmt.Fprintln(w, pageStart("Transfer Successful"))
 
 	fmt.Fprintf(w, `
@@ -1620,6 +1717,8 @@ Please sign in first.
 				Date:     now,
 			},
 		)
+
+	persistLocked()
 
 	fmt.Fprintln(w, pageStart("Withdrawal Successful"))
 
@@ -2036,33 +2135,54 @@ func createTestAccounts() error {
 
 func main() {
 
-	accounts = []Account{}
-	transactions = make(map[string][]Transaction)
 	sessions = make(map[string]string)
 
 	fmt.Println("==============================================")
 	fmt.Println("       CALEB'S CITY MALL BANK")
 	fmt.Println("==============================================")
 
-	err := createTestAccounts()
+	// Try to load existing accounts/transactions from disk
+	// first (data.json). This is what makes the app survive
+	// restarts instead of wiping every account and generating
+	// a fresh set of 1,000 test accounts every single time.
+	if loadState() {
 
-	if err != nil {
 		fmt.Println("")
-		fmt.Println("ERROR:")
-		fmt.Println(err)
+		fmt.Printf(
+			"Loaded existing data from %s (%d accounts).\n",
+			dataFile,
+			len(accounts),
+		)
+
+	} else {
+
+		accounts = []Account{}
+		transactions = make(map[string][]Transaction)
+
+		err := createTestAccounts()
+
+		if err != nil {
+			fmt.Println("")
+			fmt.Println("ERROR:")
+			fmt.Println(err)
+			fmt.Println("")
+			fmt.Println("Check your internet connection.")
+			return
+		}
+
+		mu.Lock()
+		persistLocked()
+		mu.Unlock()
+
 		fmt.Println("")
-		fmt.Println("Check your internet connection.")
-		return
+		fmt.Println("1,000 test accounts created.")
+		fmt.Println("")
+		fmt.Println("TEST LOGIN")
+		fmt.Println("------------------------------")
+		fmt.Println("Username: customer0001")
+		fmt.Println("Password: BankUser0001!")
+		fmt.Println("------------------------------")
 	}
-
-	fmt.Println("")
-	fmt.Println("1,000 test accounts created.")
-	fmt.Println("")
-	fmt.Println("TEST LOGIN")
-	fmt.Println("------------------------------")
-	fmt.Println("Username: customer0001")
-	fmt.Println("Password: BankUser0001!")
-	fmt.Println("------------------------------")
 
 	http.HandleFunc("/", home)
 
@@ -2090,7 +2210,7 @@ func main() {
 	fmt.Println("Server running on port:", port)
 	fmt.Println("")
 
-	err = http.ListenAndServe(":"+port, nil)
+	err := http.ListenAndServe(":"+port, nil)
 
 	if err != nil {
 		fmt.Println("Server error:", err)
