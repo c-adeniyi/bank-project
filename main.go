@@ -3,14 +3,11 @@ package main
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
-	"net"
 	"net/http"
-	"net/smtp"
 	"os"
 	"strconv"
 	"strings"
@@ -191,83 +188,34 @@ func loadState() bool {
 // EMAIL + CAPTCHA + 2FA HELPERS
 // ----------------------------------------------------
 func emailConfigured() bool {
-	return os.Getenv("SMTP_HOST") != "" &&
-		os.Getenv("SMTP_PORT") != "" &&
-		os.Getenv("SMTP_USER") != "" &&
-		os.Getenv("SMTP_PASS") != "" &&
-		os.Getenv("SMTP_FROM") != ""
+	return os.Getenv("RESEND_API_KEY") != "" && os.Getenv("EMAIL_FROM") != ""
 }
 
 func sendEmail(to, subject, body string) error {
 	if !emailConfigured() {
 		return fmt.Errorf("email service is not configured")
 	}
-
-	host := os.Getenv("SMTP_HOST")
-	port := os.Getenv("SMTP_PORT")
-	user := os.Getenv("SMTP_USER")
-	pass := os.Getenv("SMTP_PASS")
-	from := os.Getenv("SMTP_FROM")
-
-	addr := host + ":" + port
-
-	// smtp.SendMail has no built-in timeout, so if the connection to
-	// the mail server is slow, blocked, or unreachable (some hosts
-	// restrict outbound SMTP ports), the whole request would hang
-	// indefinitely instead of failing. Dialing manually with an
-	// explicit timeout, plus a deadline on the connection, means a
-	// bad connection fails fast with a clear error instead of leaving
-	// the page spinning forever.
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	payload := map[string]interface{}{"from": os.Getenv("EMAIL_FROM"), "to": []string{to}, "subject": subject, "text": body}
+	data, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("could not reach SMTP server %s: %w", addr, err)
+		return err
 	}
-	conn.SetDeadline(time.Now().Add(20 * time.Second))
-
-	client, err := smtp.NewClient(conn, host)
+	req, err := http.NewRequest(http.MethodPost, "https://api.resend.com/emails", strings.NewReader(string(data)))
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("smtp client setup failed: %w", err)
+		return err
 	}
-	defer client.Close()
-
-	if err := client.StartTLS(&tls.Config{ServerName: host}); err != nil {
-		return fmt.Errorf("starttls failed: %w", err)
-	}
-
-	auth := smtp.PlainAuth("", user, pass, host)
-	if err := client.Auth(auth); err != nil {
-		return fmt.Errorf("smtp auth failed: %w", err)
-	}
-
-	if err := client.Mail(from); err != nil {
-		return fmt.Errorf("smtp MAIL FROM failed: %w", err)
-	}
-	if err := client.Rcpt(to); err != nil {
-		return fmt.Errorf("smtp RCPT TO failed: %w", err)
-	}
-
-	w, err := client.Data()
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("RESEND_API_KEY"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		return fmt.Errorf("smtp DATA failed: %w", err)
+		return err
 	}
-
-	msg := []byte("From: " + from + "\r\n" +
-		"To: " + to + "\r\n" +
-		"Subject: " + subject + "\r\n" +
-		"MIME-Version: 1.0\r\n" +
-		"Content-Type: text/plain; charset=UTF-8\r\n" +
-		"\r\n" +
-		body + "\r\n")
-
-	if _, err := w.Write(msg); err != nil {
-		return fmt.Errorf("smtp write failed: %w", err)
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("email provider returned %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("smtp close failed: %w", err)
-	}
-
-	return client.Quit()
+	return nil
 }
 func randomToken() string {
 	b := make([]byte, 32)
@@ -2859,21 +2807,19 @@ func main() {
 	fmt.Println("==============================================")
 
 	// Diagnostic: confirms whether the running process can actually
-	// see the SMTP env vars. Check your Render logs after deploying —
-	// if any say "NOT SET", they aren't reaching this process (wrong
-	// service, needs redeploy, name typo, etc.), even if they look
-	// correct in the Render dashboard.
-	smtpVars := []string{"SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"}
-	for _, v := range smtpVars {
-		if val := os.Getenv(v); val != "" {
-			if v == "SMTP_PASS" {
-				fmt.Println(v+":", "set (", len(val), "chars )")
-			} else {
-				fmt.Println(v+":", val)
-			}
-		} else {
-			fmt.Println(v + ": NOT SET")
-		}
+	// see RESEND_API_KEY and EMAIL_FROM. Check your Render logs after
+	// deploying — if either says "NOT SET", the env vars aren't reaching
+	// this process (wrong service, needs redeploy, name typo, etc.),
+	// even if they look correct in the Render dashboard.
+	if os.Getenv("RESEND_API_KEY") != "" {
+		fmt.Println("RESEND_API_KEY: set (", len(os.Getenv("RESEND_API_KEY")), "chars )")
+	} else {
+		fmt.Println("RESEND_API_KEY: NOT SET")
+	}
+	if os.Getenv("EMAIL_FROM") != "" {
+		fmt.Println("EMAIL_FROM:", os.Getenv("EMAIL_FROM"))
+	} else {
+		fmt.Println("EMAIL_FROM: NOT SET")
 	}
 	fmt.Println("==============================================")
 
