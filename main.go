@@ -3,10 +3,12 @@ package main
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"net/smtp"
 	"os"
@@ -208,7 +210,47 @@ func sendEmail(to, subject, body string) error {
 	from := os.Getenv("SMTP_FROM")
 
 	addr := host + ":" + port
+
+	// smtp.SendMail has no built-in timeout, so if the connection to
+	// the mail server is slow, blocked, or unreachable (some hosts
+	// restrict outbound SMTP ports), the whole request would hang
+	// indefinitely instead of failing. Dialing manually with an
+	// explicit timeout, plus a deadline on the connection, means a
+	// bad connection fails fast with a clear error instead of leaving
+	// the page spinning forever.
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("could not reach SMTP server %s: %w", addr, err)
+	}
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp client setup failed: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.StartTLS(&tls.Config{ServerName: host}); err != nil {
+		return fmt.Errorf("starttls failed: %w", err)
+	}
+
 	auth := smtp.PlainAuth("", user, pass, host)
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("smtp auth failed: %w", err)
+	}
+
+	if err := client.Mail(from); err != nil {
+		return fmt.Errorf("smtp MAIL FROM failed: %w", err)
+	}
+	if err := client.Rcpt(to); err != nil {
+		return fmt.Errorf("smtp RCPT TO failed: %w", err)
+	}
+
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("smtp DATA failed: %w", err)
+	}
 
 	msg := []byte("From: " + from + "\r\n" +
 		"To: " + to + "\r\n" +
@@ -218,17 +260,14 @@ func sendEmail(to, subject, body string) error {
 		"\r\n" +
 		body + "\r\n")
 
-	// Gmail's SMTP server (smtp.gmail.com:587) expects STARTTLS,
-	// which smtp.SendMail negotiates automatically when the server
-	// advertises it. "user" here is the full Gmail address, and
-	// "pass" must be a 16-character Gmail App Password, not the
-	// normal account password (Gmail rejects plain passwords for
-	// SMTP auth from third-party apps).
-	if err := smtp.SendMail(addr, auth, from, []string{to}, msg); err != nil {
-		return fmt.Errorf("smtp send failed: %w", err)
+	if _, err := w.Write(msg); err != nil {
+		return fmt.Errorf("smtp write failed: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("smtp close failed: %w", err)
 	}
 
-	return nil
+	return client.Quit()
 }
 func randomToken() string {
 	b := make([]byte, 32)
@@ -1069,6 +1108,25 @@ function toggleField(id, button) {
 
 	startingBalance := 1000 * rate
 
+	// Send the verification email BEFORE saving the account. This
+	// means nothing is written to storage until email delivery is
+	// confirmed, so a slow, blocked, or failed send can never leave
+	// behind a "stuck" unverified account that permanently occupies
+	// a username/email (which is what happened before: the account
+	// was saved first, then email was attempted, so a hung send left
+	// a broken account sitting there that blocked re-registration but
+	// could never log in).
+	verifyURL := baseURL() + "/verify-email?token=" + token
+	emailBody := fmt.Sprintf(
+		"Hello %s,\n\nWelcome to Caleb's City Mall Bank.\n\nVerify your email by opening this link:\n%s\n\nIf you did not create this account, ignore this email.",
+		name, verifyURL,
+	)
+
+	if err := sendEmail(email, "Verify your Caleb's City Mall Bank account", emailBody); err != nil {
+		renderError(w, "Email Delivery Failed", "Your account could not be created because the verification email failed to send: "+err.Error(), "/register")
+		return
+	}
+
 	mu.Lock()
 	accounts = append(accounts, Account{
 		Name:         name,
@@ -1084,33 +1142,6 @@ function toggleField(id, button) {
 	verificationTokens[token] = username
 	persistLocked()
 	mu.Unlock()
-
-	verifyURL := baseURL() + "/verify-email?token=" + token
-	emailBody := fmt.Sprintf(
-		"Hello %s,\n\nWelcome to Caleb's City Mall Bank.\n\nVerify your email by opening this link:\n%s\n\nIf you did not create this account, ignore this email.",
-		name, verifyURL,
-	)
-
-	if err := sendEmail(email, "Verify your Caleb's City Mall Bank account", emailBody); err != nil {
-		// Remove the just-created account since verification email delivery failed.
-		mu.Lock()
-		for i := range accounts {
-			if accounts[i].Username == username {
-				accounts = append(accounts[:i], accounts[i+1:]...)
-				break
-			}
-		}
-		delete(verificationTokens, token)
-		persistLocked()
-		mu.Unlock()
-
-		// Show the real reason sendEmail failed instead of a hardcoded
-		// generic message, since that was misleading whenever the SMTP
-		// env vars were already set correctly but the actual send failed
-		// for some other reason (bad app password, wrong host/port, etc.).
-		renderError(w, "Email Delivery Failed", "Your account could not be created because the verification email failed to send: "+err.Error(), "/register")
-		return
-	}
 
 	fmt.Fprintln(w, pageStart("Verify Email"))
 	fmt.Fprintf(w, `
