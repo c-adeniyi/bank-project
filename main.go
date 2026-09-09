@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"net/smtp"
 	"os"
 	"strconv"
 	"strings"
@@ -188,33 +189,45 @@ func loadState() bool {
 // EMAIL + CAPTCHA + 2FA HELPERS
 // ----------------------------------------------------
 func emailConfigured() bool {
-	return os.Getenv("RESEND_API_KEY") != "" && os.Getenv("EMAIL_FROM") != ""
+	return os.Getenv("SMTP_HOST") != "" &&
+		os.Getenv("SMTP_PORT") != "" &&
+		os.Getenv("SMTP_USER") != "" &&
+		os.Getenv("SMTP_PASS") != "" &&
+		os.Getenv("SMTP_FROM") != ""
 }
 
 func sendEmail(to, subject, body string) error {
 	if !emailConfigured() {
 		return fmt.Errorf("email service is not configured")
 	}
-	payload := map[string]interface{}{"from": os.Getenv("EMAIL_FROM"), "to": []string{to}, "subject": subject, "text": body}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
+
+	host := os.Getenv("SMTP_HOST")
+	port := os.Getenv("SMTP_PORT")
+	user := os.Getenv("SMTP_USER")
+	pass := os.Getenv("SMTP_PASS")
+	from := os.Getenv("SMTP_FROM")
+
+	addr := host + ":" + port
+	auth := smtp.PlainAuth("", user, pass, host)
+
+	msg := []byte("From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n" +
+		"\r\n" +
+		body + "\r\n")
+
+	// Gmail's SMTP server (smtp.gmail.com:587) expects STARTTLS,
+	// which smtp.SendMail negotiates automatically when the server
+	// advertises it. "user" here is the full Gmail address, and
+	// "pass" must be a 16-character Gmail App Password, not the
+	// normal account password (Gmail rejects plain passwords for
+	// SMTP auth from third-party apps).
+	if err := smtp.SendMail(addr, auth, from, []string{to}, msg); err != nil {
+		return fmt.Errorf("smtp send failed: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://api.resend.com/emails", strings.NewReader(string(data)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("RESEND_API_KEY"))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("email provider returned %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
+
 	return nil
 }
 func randomToken() string {
@@ -1092,10 +1105,9 @@ function toggleField(id, button) {
 		mu.Unlock()
 
 		// Show the real reason sendEmail failed instead of a hardcoded
-		// "not configured" message, since that message was misleading
-		// whenever RESEND_API_KEY/EMAIL_FROM were already set correctly
-		// but the request to Resend failed for some other reason
-		// (bad/expired key, unverified sender domain, rate limit, etc.).
+		// generic message, since that was misleading whenever the SMTP
+		// env vars were already set correctly but the actual send failed
+		// for some other reason (bad app password, wrong host/port, etc.).
 		renderError(w, "Email Delivery Failed", "Your account could not be created because the verification email failed to send: "+err.Error(), "/register")
 		return
 	}
@@ -2816,19 +2828,21 @@ func main() {
 	fmt.Println("==============================================")
 
 	// Diagnostic: confirms whether the running process can actually
-	// see RESEND_API_KEY and EMAIL_FROM. Check your Render logs after
-	// deploying — if either says "NOT SET", the env vars aren't reaching
-	// this process (wrong service, needs redeploy, name typo, etc.),
-	// even if they look correct in the Render dashboard.
-	if os.Getenv("RESEND_API_KEY") != "" {
-		fmt.Println("RESEND_API_KEY: set (", len(os.Getenv("RESEND_API_KEY")), "chars )")
-	} else {
-		fmt.Println("RESEND_API_KEY: NOT SET")
-	}
-	if os.Getenv("EMAIL_FROM") != "" {
-		fmt.Println("EMAIL_FROM:", os.Getenv("EMAIL_FROM"))
-	} else {
-		fmt.Println("EMAIL_FROM: NOT SET")
+	// see the SMTP env vars. Check your Render logs after deploying —
+	// if any say "NOT SET", they aren't reaching this process (wrong
+	// service, needs redeploy, name typo, etc.), even if they look
+	// correct in the Render dashboard.
+	smtpVars := []string{"SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"}
+	for _, v := range smtpVars {
+		if val := os.Getenv(v); val != "" {
+			if v == "SMTP_PASS" {
+				fmt.Println(v+":", "set (", len(val), "chars )")
+			} else {
+				fmt.Println(v+":", val)
+			}
+		} else {
+			fmt.Println(v + ": NOT SET")
+		}
 	}
 	fmt.Println("==============================================")
 
